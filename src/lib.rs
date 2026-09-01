@@ -6,13 +6,18 @@
 //! permits skipping work.
 //!
 //! ```
-//! use sieve::{Artifact, Lookup, KEY_SCHEME_OPAQUE};
+//! use burton::{Artifact, Lookup};
 //!
-//! let lookup = Lookup::open("/var/lib/sieve", KEY_SCHEME_OPAQUE)
+//! # let bundle_dir = std::path::Path::new("/var/lib/burton");
+//! # let digest = [0u8; 32];
+//! # let purl = "pkg:npm/left-pad@1.3.0";
+//! // Once at startup: open the installed bundle, or run without one.
+//! let lookup = Lookup::open(bundle_dir, "purl-identity/v1")
 //!     .unwrap_or_else(|_| Lookup::empty());
 //!
-//! if !lookup.may_skip(&Artifact::sha256(&[0u8; 32])) {
-//!     // scan it
+//! // Per artifact, before the expensive work, with every key you have.
+//! if !lookup.may_skip(&Artifact::sha256(&digest).and_purl(purl)) {
+//!     // analyze it
 //! }
 //! ```
 //!

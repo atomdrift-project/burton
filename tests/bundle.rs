@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use sieve::{Artifact, Decision, KeySets, Lookup, Record, Tier, build};
+use burton::{Artifact, Decision, KeySets, Lookup, Record, Tier, build};
 
 const SCHEME: &str = "test/v1";
 
@@ -110,7 +110,7 @@ fn a_missing_filter_fails_the_whole_open() {
 
         let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
         assert!(
-            matches!(err, sieve::OpenError::Missing(ref f, _) if f == victim),
+            matches!(err, burton::OpenError::Missing(ref f, _) if f == victim),
             "{victim}: {err:?}"
         );
         // And the fallback a caller is told to use skips nothing.
@@ -129,7 +129,7 @@ fn a_corrupt_filter_fails_the_whole_open() {
 
     assert!(matches!(
         Lookup::open(dir.path(), SCHEME),
-        Err(sieve::OpenError::Invalid(_, sieve::LoadError::Truncated))
+        Err(burton::OpenError::Invalid(_, burton::LoadError::Truncated))
     ));
 }
 
@@ -144,7 +144,7 @@ fn a_filter_under_the_wrong_name_fails_the_whole_open() {
 
     assert!(matches!(
         Lookup::open(dir.path(), SCHEME),
-        Err(sieve::OpenError::Mislabelled { .. })
+        Err(burton::OpenError::Mislabelled { .. })
     ));
 }
 
@@ -154,7 +154,7 @@ fn a_bundle_from_a_different_key_scheme_is_refused() {
     publish(dir.path());
 
     let err = Lookup::open(dir.path(), "some-other-scheme/v9").unwrap_err();
-    let sieve::OpenError::KeyScheme(k) = err else {
+    let burton::OpenError::KeyScheme(k) = err else {
         panic!("expected a key scheme error, got {err:?}");
     };
     assert_eq!(k.found, SCHEME);
@@ -185,7 +185,7 @@ fn a_missing_manifest_is_not_a_bundle() {
     let dir = tempfile::tempdir().unwrap();
     assert!(matches!(
         Lookup::open(dir.path(), SCHEME),
-        Err(sieve::OpenError::Manifest(..))
+        Err(burton::OpenError::Manifest(..))
     ));
 }
 
@@ -240,7 +240,7 @@ fn an_unparseable_manifest_is_not_a_bundle() {
     std::fs::write(dir.path().join("bloom.toml"), "this is not toml {{{").unwrap();
     assert!(matches!(
         Lookup::open(dir.path(), SCHEME),
-        Err(sieve::OpenError::Schema(..))
+        Err(burton::OpenError::Schema(..))
     ));
 }
 

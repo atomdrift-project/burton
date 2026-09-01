@@ -1,12 +1,12 @@
 [package]
-name = "sieve"
+name = "burton"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 authors = ["The Atomdrift Project"]
 description = "Bloom-filter allow/deny bundles for skipping work you have already done"
 license = "Apache-2.0"
-repository = "https://github.com/atomdrift-project/sieve"
+repository = "https://github.com/atomdrift-project/burton"
 keywords = ["bloom-filter", "allowlist", "supply-chain", "scanner"]
 categories = ["data-structures", "filesystem"]
 

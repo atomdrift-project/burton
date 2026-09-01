@@ -1,15 +1,17 @@
-# sieve
+# burton
 
 Bloom-filter allow/deny bundles, for skipping work you have already done.
 
 ```rust
-use sieve::{Artifact, Lookup};
+use burton::{Artifact, Lookup};
 
-let lookup = Lookup::open("/var/lib/sieve", "purl-identity/v1")
+// Once at startup: open the installed bundle, or run without one.
+let lookup = Lookup::open(bundle_dir, "purl-identity/v1")
     .unwrap_or_else(|_| Lookup::empty());
 
-if !lookup.may_skip(&Artifact::sha256(&digest).and_purl(&purl)) {
-    scan(&artifact);
+// Per artifact, before the expensive work, with every key you have.
+if !lookup.may_skip(&Artifact::sha256(&digest).and_purl(purl)) {
+    analyze(path)?;
 }
 ```
 

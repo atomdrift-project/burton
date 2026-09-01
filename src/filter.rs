@@ -214,7 +214,7 @@ impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated => f.write_str("truncated"),
-            Self::BadMagic => f.write_str("not a sieve filter (bad magic)"),
+            Self::BadMagic => f.write_str("bad magic (not an ADBL filter)"),
             Self::UnsupportedVersion(v) => {
                 write!(f, "format v{v}, this build reads {SUPPORTED_VERSIONS:?}")
             }
