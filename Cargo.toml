@@ -2,7 +2,7 @@
 name = "burton"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97"
 authors = ["The Atomdrift Project"]
 description = "Bloom-filter allow/deny bundles for skipping work you have already done"
 license = "Apache-2.0"
