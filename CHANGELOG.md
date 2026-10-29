@@ -21,6 +21,11 @@ First public release.
 - Every filter is consulted for every key and the worst claim wins. A filter
   that cannot be read blesses nothing but no longer erases another filter's
   claim; with no claim, the result is the new `Decision::Unavailable`.
+- On Unix an open `Lookup` holds its filters open and checks the manifest's
+  identity once per decision, reopening the bundle whole when it has been
+  replaced: a decision costs a `stat` and positional reads instead of opening
+  every filter, and always reads a single build. Other platforms still reopen
+  the filters per decision, so no handle blocks an updater.
 - `write_bundle` writes each file to a temporary name, syncs, and renames it
   into place, with the manifest last.
 - `verify` refuses a vouched digest found in any adverse tier, not only `bad`.
@@ -28,6 +33,12 @@ First public release.
   by `1e-9`.
 - Purl keys are held as their 32-byte digests while building, so memory no
   longer grows with purl length.
+
+### Tooling
+
+- `make bench` / `bench-save` / `bench-check`: timings, exact allocation
+  counts, and peak heap per operation, with baseline comparison.
+- `tests/budget.rs` asserts allocation and memory budgets on every test run.
 
 ### API
 

@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Write};
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -273,15 +273,22 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
 pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
     match load_manifest(dir) {
         Err(OpenError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        other => other.map(Some),
+        other => other.map(|(manifest, _)| Some(manifest)),
     }
 }
 
-/// Read, parse, and schema-check the manifest in `dir`.
-pub(crate) fn load_manifest(dir: &Path) -> Result<Manifest, OpenError> {
+/// Read, parse, and schema-check the manifest in `dir`, with the metadata of
+/// the very file read.
+pub(crate) fn load_manifest(dir: &Path) -> Result<(Manifest, Metadata), OpenError> {
     let path = dir.join(MANIFEST_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let read = File::open(&path).and_then(|mut f| {
+        let meta = f.metadata()?;
+        let mut text = String::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+        f.read_to_string(&mut text)?;
+        Ok((text, meta))
+    });
+    let (text, meta) = match read {
+        Ok(read) => read,
         Err(source) => return Err(OpenError::Io { path, source }),
     };
     let manifest: Manifest = match toml::from_str(&text) {
@@ -299,7 +306,7 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<Manifest, OpenError> {
             found: manifest.schema,
         });
     }
-    Ok(manifest)
+    Ok((manifest, meta))
 }
 
 /// Why a bundle could not be written.

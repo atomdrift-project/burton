@@ -18,4 +18,17 @@ test:
 msrv:
 	rustup run $(MSRV) $(CARGO) test
 
-.PHONY: all lint fix test msrv
+# Timings and exact allocation counts. Record a baseline before a change with
+# `make bench-save`, then `make bench-check` fails on a regression against it.
+BASELINE ?= main
+
+bench:
+	$(CARGO) bench --bench burton
+
+bench-save:
+	$(CARGO) bench --bench burton -- --save $(BASELINE)
+
+bench-check:
+	$(CARGO) bench --bench burton -- --baseline $(BASELINE)
+
+.PHONY: all lint fix test msrv bench bench-save bench-check

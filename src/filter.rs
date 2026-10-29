@@ -39,7 +39,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -497,7 +497,8 @@ impl Filter {
 ///
 /// Opening checks the header and that the file is exactly as long as the
 /// header declares; the bits are not read, so their fill is not checked here.
-/// That is [`Filter::load`]'s job, for whoever installs a bundle.
+/// That is [`Filter::load`]'s job, for whoever installs a bundle. Reads are
+/// positional, so one handle serves any number of threads at once.
 #[derive(Debug)]
 pub(crate) struct OnDisk {
     file: File,
@@ -515,9 +516,9 @@ pub(crate) enum OnDiskError {
 
 impl OnDisk {
     pub(crate) fn open(path: &Path) -> Result<Self, OnDiskError> {
-        let mut file = File::open(path).map_err(OnDiskError::Io)?;
+        let file = File::open(path).map_err(OnDiskError::Io)?;
         let mut head = [0u8; HEADER_LEN];
-        match file.read_exact(&mut head) {
+        match read_at(&file, &mut head, 0) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 return Err(OnDiskError::Invalid(LoadError::Truncated));
@@ -535,19 +536,41 @@ impl OnDisk {
         &self.header
     }
 
+    /// Whether the file still carries the header it was opened with. A held
+    /// handle follows the file through an in-place rewrite, which may leave
+    /// different bits behind the same name.
+    #[cfg(unix)]
+    pub(crate) fn is_unchanged(&self) -> bool {
+        let mut head = [0u8; HEADER_LEN];
+        read_at(&self.file, &mut head, 0).is_ok() && Header::parse(&head) == Ok(self.header)
+    }
+
     /// [`Filter::may_contain`], reading one byte per probe.
-    pub(crate) fn may_contain(&mut self, digest: &[u8; 32]) -> io::Result<bool> {
+    pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> io::Result<bool> {
         for idx in self.header.probes(digest) {
             let mut byte = [0u8];
-            self.file
-                .seek(SeekFrom::Start(HEADER_LEN as u64 + (idx >> 3) as u64))?;
-            self.file.read_exact(&mut byte)?;
+            read_at(&self.file, &mut byte, HEADER_LEN as u64 + (idx >> 3) as u64)?;
             if byte[0] & (1u8 << (idx & 7)) == 0 {
                 return Ok(false);
             }
         }
         Ok(true)
     }
+}
+
+/// Fill `buf` from `offset`, without moving a cursor another thread may share.
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Fill `buf` from `offset`. Elsewhere a handle is never shared, so the cursor
+/// is ours to move.
+#[cfg(not(unix))]
+fn read_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
 }
 
 /// Accumulates keys and produces a [`Filter`]. Bloom filters cannot delete, so

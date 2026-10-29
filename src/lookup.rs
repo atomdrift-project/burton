@@ -4,8 +4,9 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
-use crate::bundle::{MANIFEST_SCHEMA, load_manifest};
+use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, load_manifest};
 use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of};
 
 /// What to do with an artifact before spending real work on it.
@@ -194,35 +195,101 @@ impl<'a> Artifact<'a> {
 /// An opened bundle. Open it once and share it.
 ///
 /// Filters stay on disk. Opening reads only the manifest and each filter's
-/// header, so it is cheap enough for short-lived processes. A decision opens
-/// the filters it consults and reads the few bytes its probes touch, so a
-/// bundle costs no memory for its bits, and no handle is held between
-/// decisions: an updater may replace the bundle while it is open, on every
-/// platform.
+/// header, so it is cheap enough for short-lived processes, and a decision
+/// reads only the few bytes its probes touch, so a bundle costs no memory for
+/// its bits.
+///
+/// An open bundle follows its directory. On Unix the filter files are held
+/// open, and each decision checks the manifest's identity — a single `stat` —
+/// and reopens the whole bundle when it has been replaced, as [`write_bundle`]
+/// and a directory swap both do. Decisions therefore always read one build. A
+/// replacement that will not open yields [`Decision::Unavailable`] until one
+/// does. Elsewhere no handle is held between decisions, so an updater can
+/// rename the directory out from under an open bundle; each decision reopens
+/// the filters it consults instead.
+///
+/// [`write_bundle`]: crate::write_bundle
 #[derive(Debug)]
 pub struct Lookup {
-    /// `slots[kind][tier]`, so no tier can be reached except by index.
-    slots: [[Option<Slot>; Tier::ALL.len()]; Kind::ALL.len()],
+    /// Where the bundle lives; `None` for [`Lookup::empty`].
+    source: Option<Source>,
+    current: RwLock<Generation>,
+    /// The key scheme the bundle recorded when first opened.
     scheme: Option<String>,
 }
 
+/// What a [`Lookup`] needs to reopen its bundle.
+#[derive(Debug)]
+struct Source {
+    dir: PathBuf,
+    manifest: PathBuf,
+    scheme: String,
+}
+
+/// One opened build of a bundle.
+#[derive(Debug)]
+struct Generation {
+    /// `slots[kind][tier]`, so no tier can be reached except by index.
+    slots: [[Option<Slot>; Tier::ALL.len()]; Kind::ALL.len()],
+    /// The manifest this generation was opened from; `None` for an empty one.
+    manifest: Option<FileId>,
+}
+
+/// One filter of an opened bundle, held open for the generation's life.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Slot(OnDisk);
+
+#[cfg(unix)]
+impl Slot {
+    fn new(_path: PathBuf, filter: OnDisk) -> Self {
+        Self(filter)
+    }
+
+    fn header(&self) -> &Header {
+        self.0.header()
+    }
+
+    /// Possible membership; `None` when the filter cannot be read, or was
+    /// rewritten in place since it was opened.
+    fn may_contain(&self, digest: &[u8; 32]) -> Option<bool> {
+        if !self.0.is_unchanged() {
+            return None;
+        }
+        self.0.may_contain(digest).ok()
+    }
+}
+
 /// One filter of an opened bundle: where it is, and what it was at open.
+#[cfg(not(unix))]
 #[derive(Debug)]
 struct Slot {
     path: PathBuf,
     header: Header,
 }
 
+#[cfg(not(unix))]
 impl Slot {
-    /// Possible membership, read from disk. `None` when the filter cannot be
-    /// read now, or is no longer the filter this slot was opened as.
+    fn new(path: PathBuf, filter: OnDisk) -> Self {
+        Self {
+            path,
+            header: *filter.header(),
+        }
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Possible membership, reopening the file. `None` when it cannot be read
+    /// now, or is no longer the filter this slot was opened as.
     ///
-    /// The file may belong to a newer build than the one opened, if the
-    /// bundle was replaced in between, and one decision may read filters from
-    /// both. That never yields a skip neither build would give: a claim from
-    /// either build denies it, and a blessing must come from a good filter.
+    /// The file may belong to a newer build than the one opened, and one
+    /// decision may read filters from both. That never yields a skip neither
+    /// build would give: a claim from either build denies it, and a blessing
+    /// must come from a good filter.
     fn may_contain(&self, digest: &[u8; 32]) -> Option<bool> {
-        let mut filter = OnDisk::open(&self.path).ok()?;
+        let filter = OnDisk::open(&self.path).ok()?;
         let now = filter.header();
         if (now.kind, now.tier) != (self.header.kind, self.header.tier) {
             return None;
@@ -231,40 +298,61 @@ impl Slot {
     }
 }
 
-impl Lookup {
-    /// A bundle holding nothing: [`Decision::Unknown`] to everything, and no
-    /// skips. What a caller falls back to when [`Lookup::open`] fails.
-    #[must_use]
-    pub fn empty() -> Self {
+/// What tells one manifest file from its replacement.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileId {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
         Self {
-            slots: Default::default(),
-            scheme: None,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
         }
     }
 
-    /// Open the bundle in `dir`, requiring the key scheme `scheme`.
-    ///
-    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`], and
-    /// every filter it names must be a bare file name in `dir`, have a valid
-    /// header of the stated version, and identify itself as the filter it is
-    /// named as. **Any failure fails the whole open**: a partly readable
-    /// bundle is exactly the case where a stale bless cannot be vetoed.
-    ///
-    /// A bundle recording a different `scheme` is refused — producer and
-    /// consumer that disagree would otherwise match nothing, silently and
-    /// forever. A bundle recording none predates the field and is accepted.
-    ///
-    /// Only headers are read: manifest digests are not re-verified and the
-    /// bit arrays are not scanned. Both belong to whoever installs a bundle —
-    /// check each download against its manifest digest and run
-    /// [`crate::Filter::load`] on it — so that opening stays cheap.
-    ///
-    /// # Errors
-    /// [`OpenError`] for a missing, unparseable, or unsupported manifest, a
-    /// scheme mismatch, or any named filter that will not open.
-    pub fn open(dir: impl AsRef<Path>, scheme: &str) -> Result<Self, OpenError> {
-        let dir = dir.as_ref();
-        let manifest = load_manifest(dir)?;
+    fn now(path: &Path) -> Option<Self> {
+        std::fs::metadata(path).ok().map(|m| Self::of(&m))
+    }
+}
+
+/// Elsewhere the manifest is not watched: slots reopen their files instead.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId;
+
+#[cfg(not(unix))]
+impl FileId {
+    const fn of(_: &std::fs::Metadata) -> Self {
+        Self
+    }
+
+    #[expect(clippy::unnecessary_wraps, reason = "mirrors the Unix version")]
+    const fn now(_: &Path) -> Option<Self> {
+        Some(Self)
+    }
+}
+
+impl Generation {
+    fn empty() -> Self {
+        Self {
+            slots: Default::default(),
+            manifest: None,
+        }
+    }
+
+    /// Open the bundle in `dir`: the rules of [`Lookup::open`].
+    fn open(dir: &Path, scheme: &str) -> Result<(Self, Option<String>), OpenError> {
+        let (manifest, meta) = load_manifest(dir)?;
 
         if let Some(found) = manifest.key_scheme.as_deref()
             && found != scheme
@@ -275,15 +363,18 @@ impl Lookup {
             });
         }
 
-        let mut me = Self::empty();
+        let mut generation = Self {
+            slots: Default::default(),
+            manifest: Some(FileId::of(&meta)),
+        };
         for (stem, entry) in &manifest.filter {
             let file = &entry.file;
             if Path::new(file).file_name() != Some(OsStr::new(file)) {
                 return Err(OpenError::UnsafePath { file: file.clone() });
             }
             let path = dir.join(file);
-            let header = match OnDisk::open(&path) {
-                Ok(filter) => *filter.header(),
+            let filter = match OnDisk::open(&path) {
+                Ok(filter) => filter,
                 Err(OnDiskError::Io(source)) => return Err(OpenError::Io { path, source }),
                 Err(OnDiskError::Invalid(source)) => {
                     return Err(OpenError::Invalid {
@@ -292,6 +383,7 @@ impl Lookup {
                     });
                 }
             };
+            let header = *filter.header();
             if header.stem() != *stem {
                 return Err(OpenError::Mislabelled {
                     file: file.clone(),
@@ -305,46 +397,18 @@ impl Lookup {
                     header: header.version,
                 });
             }
-            me.slots[header.kind.index()][header.tier.index()] = Some(Slot { path, header });
+            generation.slots[header.kind.index()][header.tier.index()] =
+                Some(Slot::new(path, filter));
         }
-        me.scheme = manifest.key_scheme;
-        Ok(me)
+        Ok((generation, manifest.key_scheme))
     }
 
-    /// The verdict for one artifact: every filter consulted for every key,
-    /// the worst claim wins, a blessing needs unanimity. A filter that cannot
-    /// be read when consulted cannot erase another's claim, but nothing is
-    /// blessed without it.
-    pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
+    fn decide(&self, artifact: &Artifact<'_>) -> Decision {
         let purl = artifact
             .purl
             .map(|p| self.decide_key(Kind::Purl, &digest_of(p.as_bytes())));
         let sha256 = artifact.sha256.map(|d| self.decide_key(Kind::Sha256, d));
         combine(purl.into_iter().chain(sha256))
-    }
-
-    /// Whether this artifact may be skipped.
-    #[must_use]
-    pub fn may_skip(&self, artifact: &Artifact<'_>) -> bool {
-        self.decide(artifact).may_skip()
-    }
-
-    /// True when at least one filter is loaded.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.filters().next().is_some()
-    }
-
-    /// Total keys across every loaded filter, as recorded when it was opened.
-    #[must_use]
-    pub fn key_count(&self) -> u64 {
-        self.filters().map(|slot| slot.header.n).sum()
-    }
-
-    /// The key scheme this bundle recorded, if it recorded one.
-    #[must_use]
-    pub fn key_scheme(&self) -> Option<&str> {
-        self.scheme.as_deref()
     }
 
     /// The rule for one key: every filter is read, and the worst pool wins.
@@ -390,6 +454,110 @@ impl Lookup {
 
     fn filters(&self) -> impl Iterator<Item = &Slot> {
         self.slots.iter().flatten().flatten()
+    }
+}
+
+impl Lookup {
+    /// A bundle holding nothing: [`Decision::Unknown`] to everything, and no
+    /// skips. What a caller falls back to when [`Lookup::open`] fails.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            source: None,
+            current: RwLock::new(Generation::empty()),
+            scheme: None,
+        }
+    }
+
+    /// Open the bundle in `dir`, requiring the key scheme `scheme`.
+    ///
+    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`], and
+    /// every filter it names must be a bare file name in `dir`, have a valid
+    /// header of the stated version, and identify itself as the filter it is
+    /// named as. **Any failure fails the whole open**: a partly readable
+    /// bundle is exactly the case where a stale bless cannot be vetoed.
+    ///
+    /// A bundle recording a different `scheme` is refused — producer and
+    /// consumer that disagree would otherwise match nothing, silently and
+    /// forever. A bundle recording none predates the field and is accepted.
+    ///
+    /// Only headers are read: manifest digests are not re-verified and the
+    /// bit arrays are not scanned. Both belong to whoever installs a bundle —
+    /// check each download against its manifest digest and run
+    /// [`crate::Filter::load`] on it — so that opening stays cheap.
+    ///
+    /// # Errors
+    /// [`OpenError`] for a missing, unparseable, or unsupported manifest, a
+    /// scheme mismatch, or any named filter that will not open.
+    pub fn open(dir: impl AsRef<Path>, scheme: &str) -> Result<Self, OpenError> {
+        let dir = dir.as_ref();
+        let (generation, recorded) = Generation::open(dir, scheme)?;
+        Ok(Self {
+            source: Some(Source {
+                dir: dir.to_owned(),
+                manifest: dir.join(MANIFEST_FILE),
+                scheme: scheme.to_owned(),
+            }),
+            current: RwLock::new(generation),
+            scheme: recorded,
+        })
+    }
+
+    /// The verdict for one artifact: every filter consulted for every key,
+    /// the worst claim wins, a blessing needs unanimity. A filter that cannot
+    /// be read when consulted cannot erase another's claim, but nothing is
+    /// blessed without it, and a bundle that cannot be read at all is
+    /// [`Decision::Unavailable`].
+    pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
+        self.current()
+            .map_or(Decision::Unavailable, |g| g.decide(artifact))
+    }
+
+    /// Whether this artifact may be skipped.
+    #[must_use]
+    pub fn may_skip(&self, artifact: &Artifact<'_>) -> bool {
+        self.decide(artifact).may_skip()
+    }
+
+    /// True when at least one filter is loaded.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.read().filters().next().is_some()
+    }
+
+    /// Total keys across every loaded filter, as their headers record them.
+    #[must_use]
+    pub fn key_count(&self) -> u64 {
+        self.read().filters().map(|slot| slot.header().n).sum()
+    }
+
+    /// The key scheme this bundle recorded when it was opened, if any.
+    #[must_use]
+    pub fn key_scheme(&self) -> Option<&str> {
+        self.scheme.as_deref()
+    }
+
+    /// The generation to decide with: the one open, if its manifest is still
+    /// the one in place, or else a fresh one. `None` when the bundle in place
+    /// cannot be opened; the next call tries again.
+    fn current(&self) -> Option<RwLockReadGuard<'_, Generation>> {
+        let held = self.read();
+        let Some(source) = &self.source else {
+            return Some(held);
+        };
+        if Some(FileId::now(&source.manifest)?) == held.manifest {
+            return Some(held);
+        }
+        drop(held);
+        let (fresh, _) = Generation::open(&source.dir, &source.scheme).ok()?;
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+        Some(self.read())
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Generation> {
+        // Nothing panics while holding the lock, and a generation is replaced
+        // whole, so a poisoned one is still consistent.
+        self.current.read().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

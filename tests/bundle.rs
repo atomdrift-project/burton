@@ -466,10 +466,11 @@ fn an_unreadable_filter_does_not_erase_a_claim() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
     let lk = open(dir.path());
-    std::fs::remove_file(dir.path().join("purl-good.adbl")).unwrap();
-    std::fs::remove_file(dir.path().join("sha256-sighted-hostile.adbl")).unwrap();
+    // Emptied in place, so a held handle sees it too.
+    std::fs::write(dir.path().join("purl-good.adbl"), b"").unwrap();
+    std::fs::write(dir.path().join("sha256-sighted-hostile.adbl"), b"").unwrap();
 
-    // The purl's own good filter is gone, and its bad filter still convicts.
+    // The purl's own good filter is unreadable, and its bad filter still convicts.
     assert_eq!(lk.decide(&Artifact::purl(CATALOGUED)), Decision::KnownBad);
     // A digest blessed by a readable filter is not blessed with one missing.
     assert_eq!(
@@ -519,4 +520,65 @@ fn a_filter_relabelled_while_open_decides_nothing() {
         lk.decide(&Artifact::sha256(&digest(1))),
         Decision::Unavailable
     );
+}
+
+/// An open bundle answers from the build it opened until the manifest is
+/// replaced, so filters deleted or swapped under it one at a time cannot mix
+/// two builds into one decision.
+#[cfg(unix)]
+#[test]
+fn filters_removed_under_an_unchanged_manifest_still_answer_from_the_build_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "adbl") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
+}
+
+/// A replacement that will not open decides nothing, and is retried: once a
+/// good bundle is in place again, decisions resume without reopening.
+#[test]
+fn a_broken_replacement_is_unavailable_until_it_is_fixed() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+    let manifest = std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
+
+    std::fs::write(dir.path().join(MANIFEST_FILE), "schema = 99").unwrap();
+    for tag in [1, 2, 9] {
+        assert_eq!(
+            lk.decide(&Artifact::sha256(&digest(tag))),
+            Decision::Unavailable
+        );
+    }
+
+    std::fs::write(dir.path().join(MANIFEST_FILE), manifest).unwrap();
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
+}
+
+/// A bundle swapped in as a whole directory, as an installer does it, is
+/// picked up by an open lookup.
+#[test]
+fn a_directory_swapped_in_while_open_is_read_as_the_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let live = root.path().join("bundle");
+    std::fs::create_dir(&live).unwrap();
+    publish(&live);
+    let lk = open(&live);
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+
+    let staged = root.path().join("staged");
+    std::fs::create_dir(&staged).unwrap();
+    publish_one(&staged, Tier::Bad, Record::sha256(digest(1)));
+    std::fs::rename(&live, root.path().join("old")).unwrap();
+    std::fs::rename(&staged, &live).unwrap();
+
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::KnownBad);
 }
