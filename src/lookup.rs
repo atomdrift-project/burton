@@ -1,9 +1,11 @@
 //! Consuming a bundle: the decision rule, and the one type that applies it.
 
+use std::ffi::OsStr;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::build::{MANIFEST_FILE, Manifest};
+use crate::bundle::{MANIFEST_SCHEMA, load_manifest};
 use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of};
 
 /// What to do with an artifact before spending real work on it.
@@ -28,8 +30,12 @@ pub enum Decision {
     Conflicted,
     /// Blessed, claimed by nothing, and revocable. The only skippable value.
     Skip,
-    /// Nothing is known, or a skip was withheld for safety. Scan.
+    /// Nothing is known, or a blessing had no revocation channel. Scan.
     Unknown,
+    /// No filter that could be read claims this artifact, but one could not
+    /// be read when consulted, so nothing may be blessed. Scan, and look at
+    /// the bundle.
+    Unavailable,
 }
 
 impl Decision {
@@ -57,6 +63,7 @@ impl Decision {
             Self::Conflicted => "conflicted",
             Self::Skip => "skip",
             Self::Unknown => "unknown",
+            Self::Unavailable => "unavailable",
         }
     }
 
@@ -67,7 +74,7 @@ impl Decision {
             Self::KnownBad | Self::Conflicted => Some(3),
             Self::SightedHostile => Some(2),
             Self::SightedSuspicious => Some(1),
-            Self::Skip | Self::Unknown => None,
+            Self::Skip | Self::Unknown | Self::Unavailable => None,
         }
     }
 
@@ -80,7 +87,9 @@ impl Decision {
 ///
 /// Claims are disjunctive: any key's claim is a claim against the artifact, and
 /// the worst wins. Blessings are conjunctive: a skip needs every key supplied to
-/// be blessed. A blessing beside a claim is [`Decision::Conflicted`].
+/// be blessed. A blessing beside a claim is [`Decision::Conflicted`]. With no
+/// claim, a key whose filters could not be read makes the whole
+/// [`Decision::Unavailable`].
 ///
 /// The asymmetry is the grinding defence. A digest is cheap to grind into a good
 /// filter's false-positive set; a package coordinate is not. A caller who knows
@@ -89,10 +98,11 @@ impl Decision {
 /// A fold, not a pairwise combinator: the pairwise version is not associative
 /// (`Skip, Unknown, KnownBad` lands differently by order), so a third key kind
 /// would make the answer depend on which key was asked first.
-fn combine(decisions: impl Iterator<Item = Decision>) -> Decision {
+fn combine(decisions: impl IntoIterator<Item = Decision>) -> Decision {
     let mut worst: Option<(u8, Decision)> = None;
     let mut any_blessed = false;
     let mut all_blessed = true;
+    let mut unavailable = false;
     let mut seen = false;
 
     for d in decisions {
@@ -107,6 +117,7 @@ fn combine(decisions: impl Iterator<Item = Decision>) -> Decision {
         } else {
             all_blessed = false;
         }
+        unavailable |= d == Decision::Unavailable;
     }
 
     match (worst, any_blessed) {
@@ -114,13 +125,14 @@ fn combine(decisions: impl Iterator<Item = Decision>) -> Decision {
         // neither. Never resolves back to a skip.
         (Some(_), true) => Decision::Conflicted,
         (Some((_, worst)), false) => worst,
+        (None, _) if unavailable => Decision::Unavailable,
         (None, _) if seen && all_blessed => Decision::Skip,
         (None, _) => Decision::Unknown,
     }
 }
 
-/// The adverse tiers, worst first; the first that hits decides. Adding a tier
-/// means adding a row here, and nothing else in this module knows the list.
+/// The adverse tiers, worst first. Adding a tier means adding a row here, and
+/// nothing else in this module knows the list.
 const ADVERSE: [(Tier, Decision); 3] = [
     (Tier::Bad, Decision::KnownBad),
     (Tier::SightedHostile, Decision::SightedHostile),
@@ -181,10 +193,12 @@ impl<'a> Artifact<'a> {
 
 /// An opened bundle. Open it once and share it.
 ///
-/// Filters stay on disk. A decision opens the filters it consults and reads
-/// the few bytes its probes touch, so a bundle costs no memory for its bits,
-/// and no handle is held between decisions: an updater may replace the bundle
-/// while it is open, on every platform.
+/// Filters stay on disk. Opening reads only the manifest and each filter's
+/// header, so it is cheap enough for short-lived processes. A decision opens
+/// the filters it consults and reads the few bytes its probes touch, so a
+/// bundle costs no memory for its bits, and no handle is held between
+/// decisions: an updater may replace the bundle while it is open, on every
+/// platform.
 #[derive(Debug)]
 pub struct Lookup {
     /// `slots[kind][tier]`, so no tier can be reached except by index.
@@ -223,84 +237,90 @@ impl Lookup {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            slots: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            slots: Default::default(),
             scheme: None,
         }
     }
 
     /// Open the bundle in `dir`, requiring the key scheme `scheme`.
     ///
-    /// The manifest is the authority. Every filter it names must load, be
-    /// valid, and identify itself as the file it is named as. **Any failure
-    /// fails the whole open**: a partly readable bundle is exactly the case
-    /// where a stale bless cannot be vetoed.
+    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`], and
+    /// every filter it names must be a bare file name in `dir`, have a valid
+    /// header of the stated version, and identify itself as the filter it is
+    /// named as. **Any failure fails the whole open**: a partly readable
+    /// bundle is exactly the case where a stale bless cannot be vetoed.
     ///
     /// A bundle recording a different `scheme` is refused — producer and
     /// consumer that disagree would otherwise match nothing, silently and
     /// forever. A bundle recording none predates the field and is accepted.
     ///
-    /// Manifest digests are not re-verified here, and the bit arrays are not
-    /// read: each filter's header and length are checked, and its bits are
-    /// read only as decisions probe them. Digests authenticate a download, and
-    /// [`crate::Filter::load`]'s fill checks belong to whoever installs it;
-    /// repeating either on every open costs more than it catches.
+    /// Only headers are read: manifest digests are not re-verified and the
+    /// bit arrays are not scanned. Both belong to whoever installs a bundle —
+    /// check each download against its manifest digest and run
+    /// [`crate::Filter::load`] on it — so that opening stays cheap.
     ///
     /// # Errors
-    /// [`OpenError`] for a missing or unparseable manifest, a scheme mismatch,
-    /// or any named filter that will not load.
+    /// [`OpenError`] for a missing, unparseable, or unsupported manifest, a
+    /// scheme mismatch, or any named filter that will not open.
     pub fn open(dir: impl AsRef<Path>, scheme: &str) -> Result<Self, OpenError> {
         let dir = dir.as_ref();
-        let path = dir.join(MANIFEST_FILE);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| OpenError::Manifest(path.clone(), e))?;
-        let manifest: Manifest =
-            toml::from_str(&text).map_err(|e| OpenError::Schema(path, e.to_string()))?;
+        let manifest = load_manifest(dir)?;
 
         if let Some(found) = manifest.key_scheme.as_deref()
             && found != scheme
         {
-            return Err(OpenError::KeyScheme(KeySchemeError {
+            return Err(OpenError::KeyScheme {
                 expected: scheme.to_owned(),
                 found: found.to_owned(),
-            }));
+            });
         }
 
         let mut me = Self::empty();
         for (stem, entry) in &manifest.filter {
-            let path = dir.join(&entry.file);
+            let file = &entry.file;
+            if Path::new(file).file_name() != Some(OsStr::new(file)) {
+                return Err(OpenError::UnsafePath { file: file.clone() });
+            }
+            let path = dir.join(file);
             let header = match OnDisk::open(&path) {
                 Ok(filter) => *filter.header(),
-                Err(OnDiskError::Io(e)) => return Err(OpenError::Missing(entry.file.clone(), e)),
-                Err(OnDiskError::Invalid(e)) => {
-                    return Err(OpenError::Invalid(entry.file.clone(), e));
+                Err(OnDiskError::Io(source)) => return Err(OpenError::Io { path, source }),
+                Err(OnDiskError::Invalid(source)) => {
+                    return Err(OpenError::Invalid {
+                        file: file.clone(),
+                        source,
+                    });
                 }
             };
-            if &header.stem() != stem {
+            if header.stem() != *stem {
                 return Err(OpenError::Mislabelled {
-                    file: entry.file.clone(),
+                    file: file.clone(),
                     claims: header.stem(),
                 });
             }
-            if let Some(slot) = me.slot_mut(header.kind, header.tier) {
-                *slot = Some(Slot { path, header });
+            if header.version != entry.format_version {
+                return Err(OpenError::VersionMismatch {
+                    file: file.clone(),
+                    manifest: entry.format_version,
+                    header: header.version,
+                });
             }
+            me.slots[header.kind.index()][header.tier.index()] = Some(Slot { path, header });
         }
         me.scheme = manifest.key_scheme;
         Ok(me)
     }
 
-    /// The verdict for one artifact: every tier consulted for every key, worst
-    /// claim wins, a blessing needs unanimity. A filter that cannot be read
-    /// when consulted decides nothing: the artifact is [`Decision::Unknown`].
+    /// The verdict for one artifact: every filter consulted for every key,
+    /// the worst claim wins, a blessing needs unanimity. A filter that cannot
+    /// be read when consulted cannot erase another's claim, but nothing is
+    /// blessed without it.
     pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
         let purl = artifact
             .purl
             .map(|p| self.decide_key(Kind::Purl, &digest_of(p.as_bytes())));
         let sha256 = artifact.sha256.map(|d| self.decide_key(Kind::Sha256, d));
-        purl.into_iter()
-            .chain(sha256)
-            .collect::<Option<Vec<_>>>()
-            .map_or(Decision::Unknown, |keys| combine(keys.into_iter()))
+        combine(purl.into_iter().chain(sha256))
     }
 
     /// Whether this artifact may be skipped.
@@ -317,7 +337,7 @@ impl Lookup {
 
     /// Total keys across every loaded filter, as recorded when it was opened.
     #[must_use]
-    pub fn keys(&self) -> u64 {
+    pub fn key_count(&self) -> u64 {
         self.filters().map(|slot| slot.header.n).sum()
     }
 
@@ -327,103 +347,142 @@ impl Lookup {
         self.scheme.as_deref()
     }
 
-    /// The rule for one key: worst pool wins.
+    /// The rule for one key: every filter is read, and the worst pool wins.
+    ///
+    /// Reading on past the first claim costs a few probes on a rare path and
+    /// keeps the rule free of ordering: what the key's filters say together
+    /// is the answer, whichever was read first.
     ///
     /// A blessing needs the `bad` filter loaded to be honored; that is the
     /// revocation channel. A missing *sighted* filter is not the same failure —
     /// that is a bundle predating those tiers, and [`Lookup::open`] has already
     /// ruled out anything missing by accident.
-    ///
-    /// `None` when a filter it consults cannot be read.
-    fn decide_key(&self, kind: Kind, digest: &[u8; 32]) -> Option<Decision> {
+    fn decide_key(&self, kind: Kind, digest: &[u8; 32]) -> Decision {
         let hit = |tier: Tier| {
             self.slot(kind, tier)
                 .map_or(Some(false), |slot| slot.may_contain(digest))
         };
-        let mut adverse = None;
+        let mut worst = None;
+        let mut unreadable = false;
         for (tier, verdict) in ADVERSE {
-            if hit(tier)? {
-                adverse = Some(verdict);
-                break;
+            match hit(tier) {
+                // ADVERSE is worst first, so the first claim is the worst.
+                Some(true) => worst = worst.or(Some(verdict)),
+                Some(false) => {}
+                None => unreadable = true,
             }
         }
+        let good = hit(Tier::Good);
 
-        Some(match (adverse, hit(Tier::Good)?) {
-            (Some(_), true) => Decision::Conflicted,
-            (Some(worst), false) => worst,
-            (None, true) if self.slot(kind, Tier::Bad).is_some() => Decision::Skip,
-            (None, _) => Decision::Unknown,
-        })
+        match (worst, good) {
+            (Some(_), Some(true)) => Decision::Conflicted,
+            (Some(worst), _) => worst,
+            (None, None) => Decision::Unavailable,
+            (None, Some(_)) if unreadable => Decision::Unavailable,
+            (None, Some(true)) if self.slot(kind, Tier::Bad).is_some() => Decision::Skip,
+            (None, Some(_)) => Decision::Unknown,
+        }
     }
 
-    fn slot(&self, kind: Kind, tier: Tier) -> Option<&Slot> {
-        self.slots
-            .get(kind.index())
-            .and_then(|row| row.get(tier.index()))
-            .and_then(Option::as_ref)
-    }
-
-    fn slot_mut(&mut self, kind: Kind, tier: Tier) -> Option<&mut Option<Slot>> {
-        self.slots
-            .get_mut(kind.index())
-            .and_then(|row| row.get_mut(tier.index()))
+    const fn slot(&self, kind: Kind, tier: Tier) -> Option<&Slot> {
+        self.slots[kind.index()][tier.index()].as_ref()
     }
 
     fn filters(&self) -> impl Iterator<Item = &Slot> {
-        self.slots.iter().flatten().filter_map(Option::as_ref)
+        self.slots.iter().flatten().flatten()
     }
-}
-
-/// A bundle built with a different key canonicalization than the caller uses.
-///
-/// Not corruption: producer and consumer would simply agree on nothing, and
-/// every artifact would look unknown. Failing at open makes that visible.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeySchemeError {
-    /// What the caller asked for.
-    pub expected: String,
-    /// What the bundle records.
-    pub found: String,
 }
 
 /// Why a bundle could not be opened. Every variant means the same to a caller:
 /// no usable bundle, so nothing may be skipped.
 #[derive(Debug)]
 pub enum OpenError {
-    /// The manifest is absent or unreadable.
-    Manifest(PathBuf, std::io::Error),
-    /// The manifest is not valid TOML.
-    Schema(PathBuf, String),
-    /// The bundle's key scheme is not the caller's.
-    KeyScheme(KeySchemeError),
-    /// A filter the manifest names could not be read.
-    Missing(String, std::io::Error),
+    /// A file could not be read: the manifest, or a filter it names.
+    Io {
+        /// The file being read.
+        path: PathBuf,
+        /// What went wrong.
+        source: io::Error,
+    },
+    /// The manifest is not valid TOML, or not shaped like a manifest.
+    Parse {
+        /// The manifest's path.
+        path: PathBuf,
+        /// What went wrong.
+        source: Box<toml::de::Error>,
+    },
+    /// The manifest's layout version is not [`MANIFEST_SCHEMA`].
+    Schema {
+        /// The manifest's path.
+        path: PathBuf,
+        /// The version it declares.
+        found: u32,
+    },
+    /// The bundle's key scheme is not the caller's. Not corruption: producer
+    /// and consumer would simply agree on nothing.
+    KeyScheme {
+        /// What the caller asked for.
+        expected: String,
+        /// What the bundle records.
+        found: String,
+    },
+    /// A manifest entry's file is not a bare file name in the bundle directory.
+    UnsafePath {
+        /// The file name as the manifest gives it.
+        file: String,
+    },
     /// A filter the manifest names is not a valid filter.
-    Invalid(String, LoadError),
-    /// A filter's header disagrees with the name the manifest gave it.
+    Invalid {
+        /// The file name as the manifest gives it.
+        file: String,
+        /// What is wrong with it.
+        source: LoadError,
+    },
+    /// A filter's header disagrees with the stem the manifest gave it.
     Mislabelled {
         /// The file name as the manifest gives it.
         file: String,
         /// The stem the file's own header claims.
         claims: String,
     },
+    /// A filter's header version disagrees with its manifest entry.
+    VersionMismatch {
+        /// The file name as the manifest gives it.
+        file: String,
+        /// The version the manifest records.
+        manifest: u16,
+        /// The version the file's header carries.
+        header: u16,
+    },
 }
 
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Manifest(p, e) => write!(f, "reading {}: {e}", p.display()),
-            Self::Schema(p, e) => write!(f, "parsing {}: {e}", p.display()),
-            Self::KeyScheme(k) => write!(
+            Self::Io { path, source } => write!(f, "reading {}: {source}", path.display()),
+            Self::Parse { path, source } => write!(f, "parsing {}: {source}", path.display()),
+            Self::Schema { path, found } => write!(
                 f,
-                "bundle uses key scheme {:?}, this build uses {:?}",
-                k.found, k.expected
+                "{}: manifest schema {found}, this build reads {MANIFEST_SCHEMA}",
+                path.display()
             ),
-            Self::Missing(file, e) => write!(f, "reading {file}: {e}"),
-            Self::Invalid(file, e) => write!(f, "{file}: {e}"),
+            Self::KeyScheme { expected, found } => write!(
+                f,
+                "bundle uses key scheme {found:?}, this build uses {expected:?}"
+            ),
+            Self::UnsafePath { file } => write!(f, "{file:?} is not a bare file name"),
+            Self::Invalid { file, source } => write!(f, "{file}: {source}"),
             Self::Mislabelled { file, claims } => {
                 write!(f, "{file} identifies itself as {claims}")
             }
+            Self::VersionMismatch {
+                file,
+                manifest,
+                header,
+            } => write!(
+                f,
+                "{file} is format v{header}, the manifest says v{manifest}"
+            ),
         }
     }
 }
@@ -431,37 +490,44 @@ impl fmt::Display for OpenError {
 impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Manifest(_, e) | Self::Missing(_, e) => Some(e),
-            Self::Invalid(_, e) => Some(e),
-            Self::Schema(..) | Self::KeyScheme(_) | Self::Mislabelled { .. } => None,
+            Self::Io { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+            Self::Invalid { source, .. } => Some(source),
+            Self::Schema { .. }
+            | Self::KeyScheme { .. }
+            | Self::UnsafePath { .. }
+            | Self::Mislabelled { .. }
+            | Self::VersionMismatch { .. } => None,
         }
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use Decision::{Conflicted, KnownBad, SightedHostile, SightedSuspicious, Skip, Unknown};
+    use Decision::{
+        Conflicted, KnownBad, SightedHostile, SightedSuspicious, Skip, Unavailable, Unknown,
+    };
 
-    const ALL: [Decision; 6] = [
+    const ALL: [Decision; 7] = [
         KnownBad,
         SightedHostile,
         SightedSuspicious,
         Conflicted,
         Skip,
         Unknown,
+        Unavailable,
     ];
+
+    fn of(ds: &[Decision]) -> Decision {
+        combine(ds.iter().copied())
+    }
 
     #[test]
     fn only_skip_may_skip() {
         for d in ALL {
             assert_eq!(d.may_skip(), d == Skip, "{d:?}");
         }
-    }
-
-    fn of(ds: &[Decision]) -> Decision {
-        combine(ds.iter().copied())
     }
 
     #[test]
@@ -502,6 +568,15 @@ mod tests {
             of(&[Unknown, SightedSuspicious, Unknown]),
             SightedSuspicious
         );
+        assert_eq!(of(&[KnownBad, KnownBad, SightedSuspicious]), KnownBad);
+    }
+
+    #[test]
+    fn an_unreadable_key_blocks_a_blessing_but_not_a_claim() {
+        assert_eq!(of(&[Skip, Unavailable]), Unavailable);
+        assert_eq!(of(&[Unknown, Unavailable]), Unavailable);
+        assert_eq!(of(&[KnownBad, Unavailable]), KnownBad);
+        assert_eq!(of(&[SightedSuspicious, Unavailable]), SightedSuspicious);
     }
 
     #[test]
@@ -561,25 +636,16 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for d in ALL {
             assert!(seen.insert(d.as_str()), "duplicate wire name for {d:?}");
-            assert!(!d.as_str().is_empty());
         }
     }
 
-    /// Nothing outranks a claim except a worse claim.
-    #[test]
-    fn severity_orders_the_adverse_tiers() {
-        assert_eq!(of(&[KnownBad, SightedHostile, SightedSuspicious]), KnownBad);
-        assert_eq!(of(&[SightedHostile, SightedSuspicious]), SightedHostile);
-        assert_eq!(of(&[SightedSuspicious, Unknown]), SightedSuspicious);
-    }
-
-    /// Adding a tier to `Tier` without grading it in `ADVERSE` must not
-    /// compile; this checks the table stays in the intended order meanwhile.
+    /// The table must stay in the intended order: `decide_key` keeps the first
+    /// claim it reads as the worst.
     #[test]
     fn adverse_is_ordered_worst_first() {
         let severities: Vec<Option<u8>> = ADVERSE.iter().map(|(_, d)| d.severity()).collect();
         assert!(
-            severities.windows(2).all(|w| w[0] > w[1]),
+            severities.is_sorted_by(|a, b| a > b),
             "ADVERSE must be strictly worst-first: {severities:?}"
         );
         assert!(!ADVERSE.iter().any(|(t, _)| *t == Tier::Good));
@@ -589,7 +655,7 @@ mod tests {
     fn an_empty_lookup_knows_nothing_and_skips_nothing() {
         let lk = Lookup::empty();
         assert!(!lk.is_active());
-        assert_eq!(lk.keys(), 0);
+        assert_eq!(lk.key_count(), 0);
         assert_eq!(lk.decide(&Artifact::sha256(&[1u8; 32])), Unknown);
         assert!(!lk.may_skip(&Artifact::purl("pkg:npm/x@1")));
     }

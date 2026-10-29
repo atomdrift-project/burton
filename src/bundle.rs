@@ -5,12 +5,17 @@
 //! delete.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-use crate::filter::{Builder, Filter, Kind, Tier};
+use crate::filter::{
+    Builder, Filter, Kind, SUPPORTED_VERSIONS, Tier, UnsupportedVersion, digest_of,
+};
+use crate::lookup::OpenError;
 
 /// The file naming a bundle's contents. Read by [`crate::Lookup::open`].
 pub const MANIFEST_FILE: &str = "bloom.toml";
@@ -30,43 +35,53 @@ pub struct Record {
     pub sha256: Option<[u8; 32]>,
 }
 
-/// Deduplicated keys, one set per (kind, tier), accumulated as records stream
-/// in. Nothing is buffered, so peak memory is the distinct keys and does not
-/// grow with row count.
-#[derive(Debug)]
-pub struct KeySets {
-    purl: [HashSet<String>; Tier::ALL.len()],
-    sha256: [HashSet<[u8; 32]>; Tier::ALL.len()],
-}
+impl Record {
+    /// A record known by its package coordinate alone.
+    #[must_use]
+    pub fn purl(purl: impl Into<String>) -> Self {
+        Self {
+            purl: Some(purl.into()),
+            sha256: None,
+        }
+    }
 
-impl Default for KeySets {
-    fn default() -> Self {
-        Self::new()
+    /// A record known by its content digest alone.
+    #[must_use]
+    pub const fn sha256(digest: [u8; 32]) -> Self {
+        Self {
+            purl: None,
+            sha256: Some(digest),
+        }
     }
 }
+
+/// Deduplicated keys, one set per (kind, tier), accumulated as records stream
+/// in. Keys are held as their 32-byte filter digests, so peak memory is 32
+/// bytes per distinct key and does not grow with row count.
+#[derive(Debug, Default)]
+pub struct KeySets {
+    /// `sets[kind][tier]`, as in [`crate::Lookup`].
+    sets: [[HashSet<[u8; 32]>; Tier::ALL.len()]; Kind::ALL.len()],
+}
+
+// `subtract_claims_from_good` splits each row into good and the rest.
+const _: () = assert!(Tier::Good.index() == 0, "Good must lead every slot row");
 
 impl KeySets {
     /// An empty accumulator.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            purl: std::array::from_fn(|_| HashSet::new()),
-            sha256: std::array::from_fn(|_| HashSet::new()),
-        }
+        Self::default()
     }
 
     /// Insert one record under `tier`. Each key present joins its set;
     /// duplicates collapse.
     pub fn insert(&mut self, tier: Tier, record: Record) {
-        if let Some(purl) = record.purl
-            && let Some(set) = self.purl.get_mut(tier.index())
-        {
-            set.insert(purl);
+        if let Some(purl) = record.purl {
+            self.sets[Kind::Purl.index()][tier.index()].insert(digest_of(purl.as_bytes()));
         }
-        if let Some(sha) = record.sha256
-            && let Some(set) = self.sha256.get_mut(tier.index())
-        {
-            set.insert(sha);
+        if let Some(sha) = record.sha256 {
+            self.sets[Kind::Sha256.index()][tier.index()].insert(sha);
         }
     }
 
@@ -74,8 +89,8 @@ impl KeySets {
     #[must_use]
     pub fn counts(&self, tier: Tier) -> (usize, usize) {
         (
-            self.purl.get(tier.index()).map_or(0, HashSet::len),
-            self.sha256.get(tier.index()).map_or(0, HashSet::len),
+            self.sets[Kind::Purl.index()][tier.index()].len(),
+            self.sets[Kind::Sha256.index()][tier.index()].len(),
         )
     }
 
@@ -90,25 +105,22 @@ impl KeySets {
     /// disk were built at different times, and the query-time rule cannot shrink
     /// a filter that already carries a key it should not.
     ///
-    /// `target_fp` must lie in `(0, 1e-3]`; anything else builds at `1e-9`.
-    /// A looser filter would fail [`Filter::load`]'s false-positive bound.
+    /// `target_fp` above `1e-3` is clamped to it, since a looser filter would
+    /// fail [`Filter::load`]'s false-positive bound; one that is not a positive
+    /// number builds at `1e-9`.
     #[must_use]
     pub fn into_filters(mut self, target_fp: f64) -> Vec<Filter> {
         self.subtract_claims_from_good();
         let mut out = Vec::with_capacity(Kind::ALL.len() * Tier::ALL.len());
         for tier in Tier::ALL {
-            out.push(build_keys(
-                Kind::Purl,
-                tier,
-                self.purl.get(tier.index()),
-                target_fp,
-            ));
-            out.push(build_digests(
-                Kind::Sha256,
-                tier,
-                self.sha256.get(tier.index()),
-                target_fp,
-            ));
+            for kind in Kind::ALL {
+                let keys = &self.sets[kind.index()][tier.index()];
+                let mut b = Builder::new(kind, tier, keys.len() as u64, target_fp);
+                for digest in keys {
+                    b.insert_digest(digest);
+                }
+                out.push(b.build());
+            }
         }
         out
     }
@@ -120,86 +132,47 @@ impl KeySets {
     /// v1's own semantics, where a corroborated citation *was* a bad key.
     /// `sighted-suspicious` is dropped: a v1 client cannot tell a lone
     /// prediction from a measured verdict, so folding it in would read as bad.
-    #[must_use]
-    pub fn into_filters_for(mut self, version: u16, target_fp: f64) -> Vec<Filter> {
-        if version < Tier::SightedHostile.min_format_version() {
-            self.fold(Tier::SightedHostile, Tier::Bad);
-            self.clear(Tier::SightedSuspicious);
+    ///
+    /// # Errors
+    /// [`UnsupportedVersion`] for a version outside [`SUPPORTED_VERSIONS`].
+    pub fn into_filters_for(
+        mut self,
+        version: u16,
+        target_fp: f64,
+    ) -> Result<Vec<Filter>, UnsupportedVersion> {
+        if !SUPPORTED_VERSIONS.contains(&version) {
+            return Err(UnsupportedVersion(version));
         }
-        self.into_filters(target_fp)
+        if version < Tier::SightedHostile.min_format_version() {
+            for row in &mut self.sets {
+                let hostile = std::mem::take(&mut row[Tier::SightedHostile.index()]);
+                row[Tier::Bad.index()].extend(hostile);
+                row[Tier::SightedSuspicious.index()].clear();
+            }
+        }
+        Ok(self
+            .into_filters(target_fp)
             .into_iter()
             .filter_map(|f| f.stamped_as(version))
-            .collect()
+            .collect())
     }
 
     fn subtract_claims_from_good(&mut self) {
-        let claimed_purls: HashSet<String> = Tier::ALL
-            .iter()
-            .filter(|t| **t != Tier::Good)
-            .filter_map(|t| self.purl.get(t.index()))
-            .flatten()
-            .cloned()
-            .collect();
-        let claimed_shas: HashSet<[u8; 32]> = Tier::ALL
-            .iter()
-            .filter(|t| **t != Tier::Good)
-            .filter_map(|t| self.sha256.get(t.index()))
-            .flatten()
-            .copied()
-            .collect();
-        if let Some(good) = self.purl.get_mut(Tier::Good.index()) {
-            good.retain(|k| !claimed_purls.contains(k));
-        }
-        if let Some(good) = self.sha256.get_mut(Tier::Good.index()) {
-            good.retain(|k| !claimed_shas.contains(k));
+        for row in &mut self.sets {
+            let [good, claims @ ..] = row;
+            good.retain(|k| !claims.iter().any(|c| c.contains(k)));
         }
     }
-
-    fn fold(&mut self, from: Tier, into: Tier) {
-        if let Some(taken) = self.purl.get_mut(from.index()).map(std::mem::take)
-            && let Some(dst) = self.purl.get_mut(into.index())
-        {
-            dst.extend(taken);
-        }
-        if let Some(taken) = self.sha256.get_mut(from.index()).map(std::mem::take)
-            && let Some(dst) = self.sha256.get_mut(into.index())
-        {
-            dst.extend(taken);
-        }
-    }
-
-    fn clear(&mut self, tier: Tier) {
-        if let Some(s) = self.purl.get_mut(tier.index()) {
-            s.clear();
-        }
-        if let Some(s) = self.sha256.get_mut(tier.index()) {
-            s.clear();
-        }
-    }
-}
-
-fn build_keys(kind: Kind, tier: Tier, keys: Option<&HashSet<String>>, fp: f64) -> Filter {
-    let mut b = Builder::new(kind, tier, keys.map_or(0, HashSet::len) as u64, fp);
-    for k in keys.into_iter().flatten() {
-        b.insert_key(k.as_bytes());
-    }
-    b.build()
-}
-
-fn build_digests(kind: Kind, tier: Tier, keys: Option<&HashSet<[u8; 32]>>, fp: f64) -> Filter {
-    let mut b = Builder::new(kind, tier, keys.map_or(0, HashSet::len) as u64, fp);
-    for k in keys.into_iter().flatten() {
-        b.insert_digest(k);
-    }
-    b.build()
 }
 
 /// One filter's entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
-    /// File name relative to the bundle directory, e.g. `purl-good.adbl`.
+    /// File name within the bundle directory, e.g. `purl-good.adbl`. A bare
+    /// name: [`crate::Lookup::open`] refuses anything with a path in it.
     pub file: String,
-    /// Lowercase hex SHA-256 of the file, for verifying a download.
+    /// Lowercase hex SHA-256 of the file, for an installer to verify a
+    /// download against.
     pub sha256: String,
     /// The layout version this file was written with.
     pub format_version: u16,
@@ -223,10 +196,15 @@ pub struct Manifest {
     pub filter: BTreeMap<String, Entry>,
 }
 
-/// Write every filter to `<dir>/<stem>.adbl`, plus the manifest naming them.
+/// Write every filter to `<dir>/<stem>.adbl`, then the manifest naming them.
+///
+/// Each file is written to a temporary name, synced, and renamed into place,
+/// so no reader ever sees a partly written file and the manifest is replaced
+/// last. Files are still replaced one at a time: to swap a live bundle as a
+/// whole, write into a fresh directory and rename that.
 ///
 /// `key_scheme` is recorded so a consumer using a different one fails at open
-/// instead of matching nothing.
+/// instead of matching nothing. Run [`verify`] first: nothing here does.
 ///
 /// # Errors
 /// Any file that cannot be written, or a manifest that cannot be serialized.
@@ -240,15 +218,13 @@ pub fn write_bundle(
     for filter in filters {
         let stem = filter.stem();
         let file = format!("{stem}.adbl");
-        std::fs::write(dir.join(&file), filter.as_bytes())
-            .map_err(|e| WriteError::File(file.clone(), e))?;
+        write_atomic(&dir.join(&file), filter.as_bytes())?;
         entries.insert(
             stem,
             Entry {
-                sha256: crate::hex(&sha256_of(filter.as_bytes())),
+                sha256: crate::hex(&digest_of(filter.as_bytes())),
                 // The filter's own version, not this build's: a bundle
-                // projected down for older clients writes older headers, and a
-                // publisher derives the upload path from this field.
+                // projected down for older clients writes older headers.
                 format_version: filter.version(),
                 n: filter.len(),
                 file,
@@ -261,45 +237,105 @@ pub fn write_bundle(
         key_scheme: Some(key_scheme.to_owned()),
         filter: entries,
     };
-    let text = toml::to_string(&manifest).map_err(WriteError::Manifest)?;
-    std::fs::write(dir.join(MANIFEST_FILE), text)
-        .map_err(|e| WriteError::File(MANIFEST_FILE.to_owned(), e))?;
+    let text = toml::to_string(&manifest).map_err(|source| WriteError::Serialize { source })?;
+    write_atomic(&dir.join(MANIFEST_FILE), text.as_bytes())?;
     Ok(manifest)
 }
 
-/// Read a previously built manifest, to size a new build against. Absent or
-/// unparseable means no baseline.
-#[must_use]
-pub fn read_manifest(dir: &Path) -> Option<Manifest> {
-    let text = std::fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?;
-    toml::from_str(&text).ok()
+/// Write `bytes` beside `path`, sync, and rename over it.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
+    let tmp = path.with_extension("tmp");
+    let written = File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    written.map_err(|source| {
+        // Best effort: the error being reported is the write's, not this.
+        let _ = std::fs::remove_file(&tmp);
+        WriteError::Io {
+            path: path.to_owned(),
+            source,
+        }
+    })
 }
 
-fn sha256_of(bytes: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(bytes));
-    out
+/// Read the manifest in `dir`, typically a previous build to size a new one
+/// against.
+///
+/// `Ok(None)` only when there is no manifest. One that exists but cannot be
+/// read or parsed is an error: treating it as "no baseline" would silently
+/// switch off [`verify`]'s collapse and ratio checks.
+///
+/// # Errors
+/// [`OpenError::Io`], [`OpenError::Parse`], or [`OpenError::Schema`].
+pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
+    match load_manifest(dir) {
+        Err(OpenError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        other => other.map(Some),
+    }
+}
+
+/// Read, parse, and schema-check the manifest in `dir`.
+pub(crate) fn load_manifest(dir: &Path) -> Result<Manifest, OpenError> {
+    let path = dir.join(MANIFEST_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) => return Err(OpenError::Io { path, source }),
+    };
+    let manifest: Manifest = match toml::from_str(&text) {
+        Ok(m) => m,
+        Err(source) => {
+            return Err(OpenError::Parse {
+                path,
+                source: Box::new(source),
+            });
+        }
+    };
+    if manifest.schema != MANIFEST_SCHEMA {
+        return Err(OpenError::Schema {
+            path,
+            found: manifest.schema,
+        });
+    }
+    Ok(manifest)
 }
 
 /// Why a bundle could not be written.
 #[derive(Debug)]
 pub enum WriteError {
     /// A file could not be written.
-    File(String, std::io::Error),
+    Io {
+        /// The file being written.
+        path: PathBuf,
+        /// What went wrong.
+        source: io::Error,
+    },
     /// The manifest could not be serialized.
-    Manifest(toml::ser::Error),
+    Serialize {
+        /// What went wrong.
+        source: toml::ser::Error,
+    },
 }
 
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::File(name, e) => write!(f, "writing {name}: {e}"),
-            Self::Manifest(e) => write!(f, "serializing the manifest: {e}"),
+            Self::Io { path, source } => write!(f, "writing {}: {source}", path.display()),
+            Self::Serialize { source } => write!(f, "serializing the manifest: {source}"),
         }
     }
 }
 
-impl std::error::Error for WriteError {}
+impl std::error::Error for WriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Serialize { source } => Some(source),
+        }
+    }
+}
 
 // --- Checks that run before anything is published ---------------------------
 //
@@ -309,7 +345,7 @@ impl std::error::Error for WriteError {}
 
 /// A digest that must never land in a given tier.
 struct Canary {
-    sha256: &'static str,
+    sha256: [u8; 32],
     forbidden: Tier,
 }
 
@@ -317,9 +353,14 @@ struct Canary {
 /// silent rebuild would otherwise carry all the way to a skip.
 const CANARIES: &[Canary] = &[
     // EICAR is benign by construction, but every scanner is expected to treat
-    // it as hostile. It must never be blessed.
+    // it as hostile. It must never be blessed. SHA-256
+    // 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f.
     Canary {
-        sha256: "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+        sha256: [
+            0x27, 0x5a, 0x02, 0x1b, 0xbf, 0xb6, 0x48, 0x9e, 0x54, 0xd4, 0x71, 0x89, 0x9f, 0x7d,
+            0xb9, 0xd1, 0x66, 0x3f, 0xc6, 0x95, 0xec, 0x2f, 0xe2, 0xa2, 0xc4, 0x53, 0x8a, 0xab,
+            0xf6, 0x51, 0xfd, 0x0f,
+        ],
         forbidden: Tier::Good,
     },
 ];
@@ -332,6 +373,16 @@ const MAX_SHRINK: f64 = 0.5;
 /// anyone maintaining expected counts by hand.
 const MAX_GROWTH: f64 = 3.0;
 
+/// Whether [`verify`] enforces the key-count ratio bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ratio {
+    /// A breach is fatal. The default, and right for unattended builds.
+    Enforce,
+    /// A breach is returned rather than fatal, for an operator deliberately
+    /// changing a tier's rule, where the large step *is* the change.
+    Waive,
+}
+
 /// Why a freshly built bundle must not be published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
@@ -342,8 +393,13 @@ pub enum VerifyError {
         /// The stem it was found in.
         stem: String,
     },
-    /// A digest the caller vouched for is catalogued bad.
-    Vouched(String),
+    /// A digest the caller vouched for is in an adverse tier.
+    Vouched {
+        /// The caller's label for it, such as a path.
+        label: String,
+        /// The stem it was found in.
+        stem: String,
+    },
     /// A filter that had keys now has none.
     Collapsed {
         /// The filter's stem.
@@ -360,13 +416,13 @@ pub enum VerifyError {
     },
 }
 
-impl std::fmt::Display for VerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Canary { sha256, stem } => {
                 write!(f, "canary {sha256} is in {stem} and must never be")
             }
-            Self::Vouched(what) => write!(f, "known-good {what} is in sha256-bad"),
+            Self::Vouched { label, stem } => write!(f, "known-good {label} is in {stem}"),
             Self::Collapsed { stem, was } => {
                 write!(f, "{stem} collapsed to 0 keys (was {was})")
             }
@@ -379,15 +435,15 @@ impl std::error::Error for VerifyError {}
 
 /// Refuse to publish a bundle that looks poisoned or truncated.
 ///
-/// 1. No [`CANARIES`] digest is in its forbidden tier.
-/// 2. No digest in `vouched` — artifacts the caller asserts are ubiquitously
-///    benign, such as the build host's `/bin/ls` — is catalogued bad.
+/// 1. No canary digest (EICAR, for one) is in its forbidden tier.
+/// 2. No digest in `vouched` — `(label, digest)` pairs for artifacts the
+///    caller asserts are ubiquitously benign, such as the build host's
+///    `/bin/ls` — is in any adverse tier, since any of them denies a skip.
 /// 3. No filter collapsed to zero keys or moved past the ratio bounds.
 ///
-/// `accept_unusual` downgrades **only** the ratio bounds, for the one case they
-/// cannot distinguish from a corrupt export: an operator changing a tier's rule,
-/// where the large step *is* the change. Canaries, vouched digests, and the
-/// collapse guard stay fatal. Waived breaches are returned, not swallowed.
+/// [`Ratio::Waive`] downgrades **only** the ratio bounds. Canaries, vouched
+/// digests, and the collapse guard stay fatal. Waived breaches are returned,
+/// not swallowed.
 ///
 /// # Errors
 /// The first violation found.
@@ -395,32 +451,35 @@ pub fn verify(
     filters: &[Filter],
     prev: Option<&Manifest>,
     vouched: &[(String, [u8; 32])],
-    accept_unusual: bool,
+    ratio: Ratio,
 ) -> Result<Vec<VerifyError>, VerifyError> {
-    let find = |stem: &str| filters.iter().find(|f| f.stem() == stem);
-    let mut waived = Vec::new();
+    let digests = |tier: Tier| {
+        filters
+            .iter()
+            .filter(move |f| f.kind() == Kind::Sha256 && f.tier() == tier)
+    };
 
     for c in CANARIES {
-        let Some(digest) = crate::parse_sha256_hex(c.sha256) else {
-            continue; // A malformed constant is a bug, not a bundle defect.
-        };
-        let stem = format!("sha256-{}", c.forbidden.as_str());
-        if find(&stem).is_some_and(|f| f.may_contain(&digest)) {
+        if let Some(f) = digests(c.forbidden).find(|f| f.may_contain(&c.sha256)) {
             return Err(VerifyError::Canary {
-                sha256: c.sha256.to_owned(),
-                stem,
+                sha256: crate::hex(&c.sha256),
+                stem: f.stem(),
             });
         }
     }
 
-    if let Some(bad) = find("sha256-bad") {
-        for (label, digest) in vouched {
-            if bad.may_contain(digest) {
-                return Err(VerifyError::Vouched(label.clone()));
+    for tier in Tier::ALL.into_iter().filter(|t| *t != Tier::Good) {
+        for f in digests(tier) {
+            if let Some((label, _)) = vouched.iter().find(|(_, d)| f.may_contain(d)) {
+                return Err(VerifyError::Vouched {
+                    label: label.clone(),
+                    stem: f.stem(),
+                });
             }
         }
     }
 
+    let mut waived = Vec::new();
     let Some(prev) = prev else {
         return Ok(waived);
     };
@@ -436,33 +495,32 @@ pub fn verify(
         if was < RATIO_FLOOR {
             continue;
         }
-        #[allow(clippy::cast_precision_loss)]
-        let ratio = now as f64 / was as f64;
-        let detail = if ratio < MAX_SHRINK {
+        #[expect(clippy::cast_precision_loss, reason = "key counts are far below 2^53")]
+        let ratio_now = now as f64 / was as f64;
+        let detail = if ratio_now < MAX_SHRINK {
             format!(
                 "shrank to {now} keys from {was} ({:.0}% of previous, floor {:.0}%)",
-                ratio * 100.0,
+                ratio_now * 100.0,
                 MAX_SHRINK * 100.0
             )
-        } else if ratio > MAX_GROWTH {
+        } else if ratio_now > MAX_GROWTH {
             format!(
-                "grew to {now} keys from {was} ({ratio:.1}x previous, ceiling {MAX_GROWTH:.1}x)"
+                "grew to {now} keys from {was} ({ratio_now:.1}x previous, ceiling {MAX_GROWTH:.1}x)"
             )
         } else {
             continue;
         };
         let breach = VerifyError::Ratio { stem, detail };
-        if accept_unusual {
-            waived.push(breach);
-        } else {
-            return Err(breach);
+        match ratio {
+            Ratio::Waive => waived.push(breach),
+            Ratio::Enforce => return Err(breach),
         }
     }
     Ok(waived)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -481,10 +539,7 @@ mod tests {
     }
 
     fn rec(d: [u8; 32]) -> Record {
-        Record {
-            purl: None,
-            sha256: Some(d),
-        }
+        Record::sha256(d)
     }
 
     fn find<'a>(filters: &'a [Filter], stem: &str) -> &'a Filter {
@@ -524,13 +579,28 @@ mod tests {
     }
 
     #[test]
+    fn claims_subtract_purls_from_good_too() {
+        let filters = sets(&[
+            (Tier::Good, Record::purl("pkg:npm/a@1")),
+            (Tier::Good, Record::purl("pkg:npm/b@1")),
+            (Tier::SightedSuspicious, Record::purl("pkg:npm/b@1")),
+        ])
+        .into_filters(1e-9);
+        let good = find(&filters, "purl-good");
+        assert_eq!(good.len(), 1);
+        assert!(good.may_contain(&digest_of(b"pkg:npm/a@1")));
+        assert!(!good.may_contain(&digest_of(b"pkg:npm/b@1")));
+    }
+
+    #[test]
     fn v1_folds_hostile_sightings_and_drops_the_rest() {
         let filters = sets(&[
             (Tier::Bad, rec(digest(1))),
             (Tier::SightedHostile, rec(digest(2))),
             (Tier::SightedSuspicious, rec(digest(3))),
         ])
-        .into_filters_for(1, 1e-9);
+        .into_filters_for(1, 1e-9)
+        .unwrap();
 
         assert!(filters.iter().all(|f| f.version() == 1));
         assert!(filters.iter().all(|f| f.tier().min_format_version() <= 1));
@@ -547,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_format_version_is_an_error_not_an_empty_bundle() {
+        assert_eq!(
+            KeySets::new().into_filters_for(99, 1e-9).err(),
+            Some(UnsupportedVersion(99))
+        );
+        assert_eq!(
+            KeySets::new().into_filters_for(0, 1e-9).err(),
+            Some(UnsupportedVersion(0))
+        );
+    }
+
+    #[test]
     fn write_and_reopen_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let filters =
@@ -556,7 +638,7 @@ mod tests {
         assert_eq!(m.schema, MANIFEST_SCHEMA);
         assert_eq!(m.key_scheme.as_deref(), Some("test/v1"));
         assert_eq!(m.filter.len(), filters.len());
-        assert_eq!(read_manifest(dir.path()).as_ref(), Some(&m));
+        assert_eq!(read_manifest(dir.path()).unwrap().as_ref(), Some(&m));
 
         let lk = crate::Lookup::open(dir.path(), "test/v1").unwrap();
         assert!(lk.may_skip(&crate::Artifact::sha256(&digest(4))));
@@ -567,6 +649,36 @@ mod tests {
     }
 
     #[test]
+    fn writing_leaves_no_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let filters = KeySets::new().into_filters(1e-9);
+        write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap();
+        write_bundle(dir.path(), &filters, "2026-09-01", "test/v1").unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = filters
+            .iter()
+            .map(|f| format!("{}.adbl", f.stem()))
+            .chain([MANIFEST_FILE.to_owned()])
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn a_failed_write_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir");
+        let filters = KeySets::new().into_filters(1e-9);
+        let err = write_bundle(&missing, &filters, "2026-08-31", "test/v1").unwrap_err();
+        assert!(err.to_string().contains("no-such-dir"), "{err}");
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
     fn manifest_sha256_matches_the_bytes_written() {
         let dir = tempfile::tempdir().unwrap();
         let filters = sets(&[(Tier::Good, rec(digest(6)))]).into_filters(1e-9);
@@ -574,7 +686,7 @@ mod tests {
         for entry in m.filter.values() {
             let bytes = std::fs::read(dir.path().join(&entry.file)).unwrap();
             assert_eq!(
-                crate::hex(&sha256_of(&bytes)),
+                crate::hex(&digest_of(&bytes)),
                 entry.sha256,
                 "{}",
                 entry.file
@@ -583,23 +695,59 @@ mod tests {
     }
 
     #[test]
+    fn read_manifest_tells_absent_from_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_manifest(dir.path()).unwrap(), None);
+
+        std::fs::write(dir.path().join(MANIFEST_FILE), "garbage {{").unwrap();
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(OpenError::Parse { .. })
+        ));
+
+        let mut m = baseline(&[("sha256-good", 1)]);
+        m.schema = MANIFEST_SCHEMA + 1;
+        std::fs::write(dir.path().join(MANIFEST_FILE), toml::to_string(&m).unwrap()).unwrap();
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(OpenError::Schema { found, .. }) if found == MANIFEST_SCHEMA + 1
+        ));
+    }
+
+    #[test]
+    fn the_canary_is_eicar() {
+        let eicar = CANARIES.first().unwrap();
+        assert_eq!(
+            crate::hex(&eicar.sha256),
+            "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+        );
+    }
+
+    #[test]
     fn a_blessed_canary_is_refused() {
-        let eicar = crate::parse_sha256_hex(CANARIES.first().unwrap().sha256).unwrap();
+        let eicar = CANARIES.first().unwrap().sha256;
         let filters = sets(&[(Tier::Good, rec(eicar))]).into_filters(1e-9);
         assert!(matches!(
-            verify(&filters, None, &[], false),
+            verify(&filters, None, &[], Ratio::Enforce),
             Err(VerifyError::Canary { .. })
         ));
     }
 
     #[test]
-    fn a_vouched_digest_in_bad_is_refused() {
-        let filters = sets(&[(Tier::Bad, rec(digest(7)))]).into_filters(1e-9);
-        let vouched = [("/bin/ls".to_owned(), digest(7))];
-        assert_eq!(
-            verify(&filters, None, &vouched, false),
-            Err(VerifyError::Vouched("/bin/ls".to_owned()))
-        );
+    fn a_vouched_digest_in_any_adverse_tier_is_refused() {
+        for tier in [Tier::Bad, Tier::SightedHostile, Tier::SightedSuspicious] {
+            let filters = sets(&[(tier, rec(digest(7)))]).into_filters(1e-9);
+            let vouched = [("/bin/ls".to_owned(), digest(7))];
+            let err = verify(&filters, None, &vouched, Ratio::Enforce).unwrap_err();
+            assert_eq!(
+                err,
+                VerifyError::Vouched {
+                    label: "/bin/ls".to_owned(),
+                    stem: format!("sha256-{}", tier.as_str()),
+                },
+            );
+            assert!(err.to_string().contains("/bin/ls"), "{err}");
+        }
     }
 
     /// A manifest describing `n` keys per stem, for the ratio checks.
@@ -646,29 +794,10 @@ mod tests {
     #[test]
     fn a_record_keys_only_the_fields_it_has() {
         let mut sets = KeySets::new();
-        sets.insert(
-            Tier::Good,
-            Record {
-                purl: Some("pkg:npm/x@1".to_owned()),
-                sha256: None,
-            },
-        );
-        sets.insert(
-            Tier::Good,
-            Record {
-                purl: None,
-                sha256: Some(digest(2)),
-            },
-        );
+        sets.insert(Tier::Good, Record::purl("pkg:npm/x@1"));
+        sets.insert(Tier::Good, rec(digest(2)));
         sets.insert(Tier::Good, Record::default());
         assert_eq!(sets.counts(Tier::Good), (1, 1));
-    }
-
-    #[test]
-    fn an_unreadable_format_version_produces_no_bundle() {
-        // The CLI relies on this to refuse to publish rather than write nothing.
-        let filters = KeySets::new().into_filters_for(99, 1e-9);
-        assert!(filters.is_empty());
     }
 
     #[test]
@@ -704,7 +833,7 @@ n = 7
     fn verify_passes_a_clean_build() {
         let filters =
             sets(&[(Tier::Good, rec(digest(1))), (Tier::Bad, rec(digest(2)))]).into_filters(1e-9);
-        assert_eq!(verify(&filters, None, &[], false), Ok(vec![]));
+        assert_eq!(verify(&filters, None, &[], Ratio::Enforce), Ok(vec![]));
     }
 
     /// Both ends of the ratio band, and the middle that must pass.
@@ -714,14 +843,15 @@ n = 7
         let filters = sets(&rows).into_filters(1e-9); // 256 keys
 
         let prev = baseline(&[("sha256-bad", 1_000)]);
-        assert!(matches!(
-            verify(&filters, Some(&prev), &[], false),
-            Err(VerifyError::Ratio { .. })
-        ));
+        let err = verify(&filters, Some(&prev), &[], Ratio::Enforce).unwrap_err();
+        assert!(err.to_string().contains("shrank to 256"), "{err}");
 
         // 80 is under RATIO_FLOOR, so the ratios do not apply at all.
         let prev = baseline(&[("sha256-bad", 80)]);
-        assert_eq!(verify(&filters, Some(&prev), &[], false), Ok(vec![]));
+        assert_eq!(
+            verify(&filters, Some(&prev), &[], Ratio::Enforce),
+            Ok(vec![])
+        );
 
         // A growth breach needs a previous count at or above the floor.
         let many: Vec<(Tier, Record)> = (0..8_000u32)
@@ -733,7 +863,7 @@ n = 7
             .collect();
         let prev = baseline(&[("sha256-bad", 2_000)]);
         let grown = sets(&many).into_filters(1e-9); // 8000/2000 = 4x
-        let err = verify(&grown, Some(&prev), &[], false).unwrap_err();
+        let err = verify(&grown, Some(&prev), &[], Ratio::Enforce).unwrap_err();
         let VerifyError::Ratio { detail, .. } = &err else {
             panic!("expected a ratio breach, got {err:?}");
         };
@@ -742,54 +872,29 @@ n = 7
         // In band: 3000 from 2000 is 1.5x.
         let mid: Vec<(Tier, Record)> = many.into_iter().take(3_000).collect();
         assert_eq!(
-            verify(&sets(&mid).into_filters(1e-9), Some(&prev), &[], false),
+            verify(
+                &sets(&mid).into_filters(1e-9),
+                Some(&prev),
+                &[],
+                Ratio::Enforce
+            ),
             Ok(vec![])
         );
-    }
-
-    #[test]
-    fn default_matches_new() {
-        assert_eq!(
-            KeySets::default().counts(Tier::Good),
-            KeySets::new().counts(Tier::Good)
-        );
-    }
-
-    /// Error text is what an operator sees at 3am. Every variant must render.
-    #[test]
-    fn every_error_renders() {
-        let errors = [
-            VerifyError::Canary {
-                sha256: "ab".to_owned(),
-                stem: "sha256-good".to_owned(),
-            },
-            VerifyError::Vouched("/bin/ls".to_owned()),
-            VerifyError::Collapsed {
-                stem: "sha256-bad".to_owned(),
-                was: 9,
-            },
-            VerifyError::Ratio {
-                stem: "purl-good".to_owned(),
-                detail: "shrank".to_owned(),
-            },
-        ];
-        for e in &errors {
-            assert!(!e.to_string().is_empty(), "{e:?}");
-        }
-        let io = WriteError::File("x.adbl".to_owned(), std::io::Error::other("disk on fire"));
-        assert!(io.to_string().contains("x.adbl"));
-        assert!(io.to_string().contains("disk on fire"));
     }
 
     #[test]
     fn a_collapse_is_fatal_even_with_the_override() {
         let filters = KeySets::new().into_filters(1e-9);
         let prev = baseline(&[("sha256-good", 10_000)]);
-        for accept in [false, true] {
-            assert!(matches!(
-                verify(&filters, Some(&prev), &[], accept),
-                Err(VerifyError::Collapsed { .. })
-            ));
+        for ratio in [Ratio::Enforce, Ratio::Waive] {
+            let err = verify(&filters, Some(&prev), &[], ratio).unwrap_err();
+            assert_eq!(
+                err,
+                VerifyError::Collapsed {
+                    stem: "sha256-good".to_owned(),
+                    was: 10_000
+                }
+            );
         }
     }
 
@@ -802,10 +907,10 @@ n = 7
         let prev = baseline(&[("sha256-good", 100_000)]);
 
         assert!(matches!(
-            verify(&filters, Some(&prev), &[], false),
+            verify(&filters, Some(&prev), &[], Ratio::Enforce),
             Err(VerifyError::Ratio { .. })
         ));
-        let waived = verify(&filters, Some(&prev), &[], true).unwrap();
+        let waived = verify(&filters, Some(&prev), &[], Ratio::Waive).unwrap();
         assert_eq!(waived.len(), 1);
         assert!(matches!(waived.first(), Some(VerifyError::Ratio { .. })));
     }
@@ -814,6 +919,9 @@ n = 7
     fn small_filters_swing_freely() {
         let filters = sets(&[(Tier::Bad, rec(digest(8)))]).into_filters(1e-9);
         let prev = baseline(&[("sha256-bad", 900)]);
-        assert_eq!(verify(&filters, Some(&prev), &[], false), Ok(vec![]));
+        assert_eq!(
+            verify(&filters, Some(&prev), &[], Ratio::Enforce),
+            Ok(vec![])
+        );
     }
 }

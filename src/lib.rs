@@ -2,10 +2,10 @@
 //!
 //! A bundle holds one filter per key kind (`purl`, `sha256`) and trust tier
 //! (`good`, `bad`, `sighted-hostile`, `sighted-suspicious`). [`Lookup::decide`]
-//! consults every tier and returns a [`Decision`]. Only [`Decision::may_skip`]
-//! permits skipping work.
+//! consults every filter for every key and returns a [`Decision`]. Only
+//! [`Decision::may_skip`] permits skipping work.
 //!
-//! ```
+//! ```no_run
 //! use burton::{Artifact, Lookup};
 //!
 //! # let bundle_dir = std::path::Path::new("/var/lib/burton");
@@ -23,9 +23,10 @@
 //!
 //! # Worst pool wins
 //!
-//! An artifact is skippable only when it is blessed and nothing claims it. The
-//! weakest adverse tier is enough to deny a skip: a bless means "do not look at
-//! this at all", so the bar is "nothing anywhere has anything to say".
+//! An artifact is skippable only when it is blessed and nothing claims it.
+//! Every filter is read, and the weakest adverse tier is enough to deny a
+//! skip: a bless means "do not look at this at all", so the bar is "nothing
+//! anywhere has anything to say".
 //!
 //! # Failure is always safe
 //!
@@ -36,7 +37,8 @@
 //! - [`Lookup::open`] treats the manifest as authority and fails whole. A bundle
 //!   that will not open completely grants nothing.
 //! - Filters stay on disk and are read as decisions probe them. A filter that
-//!   cannot be read when consulted, such as mid-update, grants nothing either.
+//!   cannot be read when consulted, such as mid-update, blesses nothing
+//!   ([`Decision::Unavailable`]) and erases no other filter's claim.
 //! - A bless is withheld unless the matching `bad` filter is loaded. That filter
 //!   is the revocation channel.
 //! - Single-filter membership is not public. Asking "is this blessed?" without
@@ -56,15 +58,18 @@
 //! belongs to whoever owns the corpus — a bundle records the scheme that
 //! produced its keys and [`Lookup::open`] refuses one it does not expect.
 
-#![forbid(unsafe_code)]
-
-pub mod build;
+mod bundle;
 mod filter;
 mod lookup;
 
-pub use build::{KeySets, Manifest, Record};
-pub use filter::{FORMAT_VERSION, Filter, Kind, LoadError, SUPPORTED_VERSIONS, Tier};
-pub use lookup::{Artifact, Decision, KeySchemeError, Lookup, OpenError};
+pub use bundle::{
+    Entry, KeySets, MANIFEST_FILE, MANIFEST_SCHEMA, Manifest, Ratio, Record, VerifyError,
+    WriteError, read_manifest, verify, write_bundle,
+};
+pub use filter::{
+    FORMAT_VERSION, Filter, Kind, LoadError, SUPPORTED_VERSIONS, Tier, UnsupportedVersion,
+};
+pub use lookup::{Artifact, Decision, Lookup, OpenError};
 
 /// Key scheme for bundles whose keys are raw byte strings.
 ///
@@ -74,20 +79,20 @@ pub use lookup::{Artifact, Decision, KeySchemeError, Lookup, OpenError};
 /// digest-only bundles are.
 pub const KEY_SCHEME_OPAQUE: &str = "opaque";
 
-/// Parse a 64-character hex SHA-256 into its 32 bytes.
+/// Parse a 64-character hex SHA-256, as manifests and most corpora spell it,
+/// into the 32 bytes [`Record`] and [`Artifact`] take.
 ///
 /// `None` for any wrong length or non-hex character, so a malformed row is
 /// skipped rather than silently hashed as text.
 #[must_use]
 pub fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim().as_bytes();
-    if s.len() != 64 {
+    let (pairs, rest) = s.trim().as_bytes().as_chunks::<2>();
+    if pairs.len() != 32 || !rest.is_empty() {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let (hi, lo) = (s.get(i * 2)?, s.get(i * 2 + 1)?);
-        *slot = (hex_nibble(*hi)? << 4) | hex_nibble(*lo)?;
+    for (slot, &[hi, lo]) in out.iter_mut().zip(pairs) {
+        *slot = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
     }
     Some(out)
 }
@@ -102,15 +107,12 @@ const fn hex_nibble(c: u8) -> Option<u8> {
 }
 
 /// Lowercase hex of a SHA-256 digest.
-#[must_use]
-pub fn hex(digest: &[u8; 32]) -> String {
-    const fn nibble(n: u8) -> char {
-        (if n < 10 { b'0' + n } else { b'a' + n - 10 }) as char
-    }
+fn hex(digest: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
     for b in digest {
-        out.push(nibble(b >> 4));
-        out.push(nibble(b & 0x0f));
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
     }
     out
 }
@@ -121,8 +123,10 @@ mod tests {
 
     #[test]
     fn hex_round_trips() {
-        let d = [0xabu8; 32];
+        let d: [u8; 32] = std::array::from_fn(|i| u8::try_from(i * 8).unwrap_or(0));
         assert_eq!(parse_sha256_hex(&hex(&d)), Some(d));
+        assert_eq!(parse_sha256_hex(&hex(&d).to_uppercase()), Some(d));
+        assert_eq!(parse_sha256_hex(&format!(" {}\n", hex(&d))), Some(d));
     }
 
     #[test]
@@ -130,5 +134,6 @@ mod tests {
         assert_eq!(parse_sha256_hex("nope"), None);
         assert_eq!(parse_sha256_hex(&"z".repeat(64)), None);
         assert_eq!(parse_sha256_hex(&"a".repeat(63)), None);
+        assert_eq!(parse_sha256_hex(&"a".repeat(65)), None);
     }
 }

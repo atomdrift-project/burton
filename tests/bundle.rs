@@ -3,13 +3,19 @@
 //! Every one of these is a way a bundle can be wrong. In all of them the
 //! required outcome is the same: nothing is skipped.
 
-#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::path::Path;
 
-use burton::{Artifact, Decision, KeySets, Lookup, Record, Tier, build};
+use burton::{
+    Artifact, Decision, KeySets, LoadError, Lookup, MANIFEST_FILE, OpenError, Record, Tier,
+    read_manifest, write_bundle,
+};
 
 const SCHEME: &str = "test/v1";
+
+const BLESSED: &str = "pkg:npm/left-pad@1.3.0";
+const CATALOGUED: &str = "pkg:npm/evil@6.6.6";
 
 fn digest(tag: u8) -> [u8; 32] {
     let mut d = [0u8; 32];
@@ -17,36 +23,43 @@ fn digest(tag: u8) -> [u8; 32] {
     d
 }
 
-/// A bundle where `blessed` is good and `catalogued` is bad, both by digest and
-/// by coordinate.
+/// A bundle where digest 1 and `BLESSED` are good, digest 2 and `CATALOGUED`
+/// are bad, and digest 3 is a lone sighting.
 fn publish(dir: &Path) {
     let mut sets = KeySets::new();
     sets.insert(
         Tier::Good,
         Record {
-            purl: Some("pkg:npm/left-pad@1.3.0".to_owned()),
+            purl: Some(BLESSED.to_owned()),
             sha256: Some(digest(1)),
         },
     );
     sets.insert(
         Tier::Bad,
         Record {
-            purl: Some("pkg:npm/evil@6.6.6".to_owned()),
+            purl: Some(CATALOGUED.to_owned()),
             sha256: Some(digest(2)),
         },
     );
-    sets.insert(
-        Tier::SightedSuspicious,
-        Record {
-            purl: None,
-            sha256: Some(digest(3)),
-        },
-    );
-    build::write_bundle(dir, &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
+    sets.insert(Tier::SightedSuspicious, Record::sha256(digest(3)));
+    write_bundle(dir, &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
+}
+
+fn publish_one(dir: &Path, tier: Tier, record: Record) {
+    let mut sets = KeySets::new();
+    sets.insert(tier, record);
+    write_bundle(dir, &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
 }
 
 fn open(dir: &Path) -> Lookup {
     Lookup::open(dir, SCHEME).unwrap()
+}
+
+/// Rewrite the manifest in `dir` through `edit`.
+fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut burton::Manifest)) {
+    let mut manifest = read_manifest(dir).unwrap().unwrap();
+    edit(&mut manifest);
+    std::fs::write(dir.join(MANIFEST_FILE), toml::to_string(&manifest).unwrap()).unwrap();
 }
 
 #[test]
@@ -57,9 +70,9 @@ fn a_complete_bundle_blesses_what_it_should() {
 
     assert!(lk.is_active());
     assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
-    assert!(lk.may_skip(&Artifact::purl("pkg:npm/left-pad@1.3.0")));
+    assert!(lk.may_skip(&Artifact::purl(BLESSED)));
     // Both keys agree, which is the strongest form of the question.
-    assert!(lk.may_skip(&Artifact::purl("pkg:npm/left-pad@1.3.0").and_sha256(&digest(1))));
+    assert!(lk.may_skip(&Artifact::purl(BLESSED).and_sha256(&digest(1))));
 
     assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
     assert_eq!(
@@ -92,9 +105,30 @@ fn keys_that_disagree_are_a_conflict() {
     let lk = open(dir.path());
 
     let catalogued = digest(2);
-    let mixed = Artifact::purl("pkg:npm/left-pad@1.3.0").and_sha256(&catalogued);
+    let mixed = Artifact::purl(BLESSED).and_sha256(&catalogued);
     assert_eq!(lk.decide(&mixed), Decision::Conflicted);
     assert!(!lk.may_skip(&mixed));
+}
+
+/// Every filter is read, so a claim in any tier is found even when another
+/// tier also claims the artifact, and the worst one is reported.
+#[test]
+fn every_tier_is_consulted_and_the_worst_claim_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sets = KeySets::new();
+    for tier in [Tier::Bad, Tier::SightedHostile, Tier::SightedSuspicious] {
+        sets.insert(tier, Record::sha256(digest(1)));
+    }
+    sets.insert(Tier::SightedHostile, Record::sha256(digest(2)));
+    sets.insert(Tier::SightedSuspicious, Record::sha256(digest(2)));
+    write_bundle(dir.path(), &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
+    let lk = open(dir.path());
+
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::KnownBad);
+    assert_eq!(
+        lk.decide(&Artifact::sha256(&digest(2))),
+        Decision::SightedHostile
+    );
 }
 
 #[test]
@@ -110,12 +144,15 @@ fn a_missing_filter_fails_the_whole_open() {
 
         let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
         assert!(
-            matches!(err, burton::OpenError::Missing(ref f, _) if f == victim),
+            matches!(&err, OpenError::Io { path, source }
+                if path.ends_with(victim) && source.kind() == std::io::ErrorKind::NotFound),
             "{victim}: {err:?}"
         );
-        // And the fallback a caller is told to use skips nothing.
-        assert!(!Lookup::empty().may_skip(&Artifact::sha256(&digest(1))));
+        assert!(err.to_string().contains(victim), "{err}");
+        assert!(std::error::Error::source(&err).is_some());
     }
+    // And the fallback a caller is told to use skips nothing.
+    assert!(!Lookup::empty().may_skip(&Artifact::sha256(&digest(1))));
 }
 
 #[test]
@@ -127,10 +164,16 @@ fn a_corrupt_filter_fails_the_whole_open() {
     bytes.truncate(bytes.len() - 1);
     std::fs::write(&victim, bytes).unwrap();
 
-    assert!(matches!(
-        Lookup::open(dir.path(), SCHEME),
-        Err(burton::OpenError::Invalid(_, burton::LoadError::Truncated))
-    ));
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(&err, OpenError::Invalid { file, source: LoadError::Truncated }
+            if file == "sha256-sighted-hostile.adbl"),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("sha256-sighted-hostile.adbl"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -142,10 +185,79 @@ fn a_filter_under_the_wrong_name_fails_the_whole_open() {
     let bad = std::fs::read(dir.path().join("sha256-bad.adbl")).unwrap();
     std::fs::write(dir.path().join("sha256-good.adbl"), bad).unwrap();
 
-    assert!(matches!(
-        Lookup::open(dir.path(), SCHEME),
-        Err(burton::OpenError::Mislabelled { .. })
-    ));
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(&err, OpenError::Mislabelled { file, claims }
+            if file == "sha256-good.adbl" && claims == "sha256-bad"),
+        "{err:?}"
+    );
+}
+
+/// A manifest is untrusted input: its file names must not reach outside the
+/// bundle directory, however valid the file they point at.
+#[test]
+fn a_manifest_cannot_point_outside_its_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let (bundle, other) = (root.path().join("bundle"), root.path().join("other"));
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    publish(&bundle);
+    publish(&other);
+
+    let absolute = other.join("sha256-good.adbl").to_str().unwrap().to_owned();
+    for file in ["../other/sha256-good.adbl", absolute.as_str(), "..", ""] {
+        edit_manifest(&bundle, |m| {
+            m.filter.get_mut("sha256-good").unwrap().file = file.to_owned();
+        });
+        let err = Lookup::open(&bundle, SCHEME).unwrap_err();
+        assert!(
+            matches!(&err, OpenError::UnsafePath { file: f } if f == file),
+            "{file}: {err:?}"
+        );
+    }
+}
+
+/// A content-addressed file name is still a bare name, and opens.
+#[test]
+fn a_manifest_may_name_files_however_it_likes_within_its_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    std::fs::rename(
+        dir.path().join("sha256-good.adbl"),
+        dir.path().join("sha256-good-0123abcd.adbl"),
+    )
+    .unwrap();
+    edit_manifest(dir.path(), |m| {
+        m.filter.get_mut("sha256-good").unwrap().file = "sha256-good-0123abcd.adbl".to_owned();
+    });
+    assert!(open(dir.path()).may_skip(&Artifact::sha256(&digest(1))));
+}
+
+#[test]
+fn a_manifest_of_another_schema_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    edit_manifest(dir.path(), |m| m.schema = 99);
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(err, OpenError::Schema { found: 99, .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_filter_whose_version_disagrees_with_the_manifest_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    edit_manifest(dir.path(), |m| {
+        m.filter.get_mut("purl-bad").unwrap().format_version = 1;
+    });
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(&err, OpenError::VersionMismatch { file, manifest: 1, header: 2 }
+            if file == "purl-bad.adbl"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -154,25 +266,19 @@ fn a_bundle_from_a_different_key_scheme_is_refused() {
     publish(dir.path());
 
     let err = Lookup::open(dir.path(), "some-other-scheme/v9").unwrap_err();
-    let burton::OpenError::KeyScheme(k) = err else {
+    assert!(err.to_string().contains("some-other-scheme/v9"), "{err}");
+    let OpenError::KeyScheme { expected, found } = err else {
         panic!("expected a key scheme error, got {err:?}");
     };
-    assert_eq!(k.found, SCHEME);
-    assert_eq!(k.expected, "some-other-scheme/v9");
+    assert_eq!(found, SCHEME);
+    assert_eq!(expected, "some-other-scheme/v9");
 }
 
 #[test]
 fn a_bundle_that_names_no_scheme_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
-    let path = dir.path().join("bloom.toml");
-    let text = std::fs::read_to_string(&path).unwrap();
-    let stripped: String = text
-        .lines()
-        .filter(|l| !l.starts_with("key_scheme"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&path, stripped).unwrap();
+    edit_manifest(dir.path(), |m| m.key_scheme = None);
 
     // Nothing to disagree with, so it opens. It just cannot vouch for itself.
     let lk = Lookup::open(dir.path(), "anything-at-all").unwrap();
@@ -183,10 +289,21 @@ fn a_bundle_that_names_no_scheme_is_accepted() {
 #[test]
 fn a_missing_manifest_is_not_a_bundle() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(matches!(
-        Lookup::open(dir.path(), SCHEME),
-        Err(burton::OpenError::Manifest(..))
-    ));
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(&err, OpenError::Io { path, .. } if path.ends_with(MANIFEST_FILE)),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_unparseable_manifest_is_not_a_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    std::fs::write(dir.path().join(MANIFEST_FILE), "this is not toml {{{").unwrap();
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(matches!(err, OpenError::Parse { .. }), "{err:?}");
+    assert!(std::error::Error::source(&err).is_some());
 }
 
 #[test]
@@ -197,18 +314,17 @@ fn without_the_revocation_channel_nothing_is_blessed() {
     // A bundle that never carried a `bad` filter: the manifest does not name
     // one, so the open succeeds. A blessing with no way to revoke it is still
     // not honored.
-    let path = dir.path().join("bloom.toml");
-    let mut manifest = build::read_manifest(dir.path()).unwrap();
-    manifest.filter.remove("sha256-bad");
+    edit_manifest(dir.path(), |m| {
+        m.filter.remove("sha256-bad");
+    });
     std::fs::remove_file(dir.path().join("sha256-bad.adbl")).unwrap();
-    std::fs::write(&path, toml::to_string(&manifest).unwrap()).unwrap();
 
-    let lk = Lookup::open(dir.path(), SCHEME).unwrap();
+    let lk = open(dir.path());
     assert!(lk.is_active());
     assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
     assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
     // The purl side still has its own bad channel, so it is unaffected.
-    assert!(lk.may_skip(&Artifact::purl("pkg:npm/left-pad@1.3.0")));
+    assert!(lk.may_skip(&Artifact::purl(BLESSED)));
 }
 
 #[test]
@@ -225,7 +341,7 @@ fn a_bundle_never_loses_a_key_it_holds() {
             },
         );
     }
-    build::write_bundle(dir.path(), &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
+    write_bundle(dir.path(), &sets.into_filters(1e-9), "2026-08-31", SCHEME).unwrap();
 
     let lk = open(dir.path());
     for purl in &purls {
@@ -234,20 +350,9 @@ fn a_bundle_never_loses_a_key_it_holds() {
 }
 
 #[test]
-fn an_unparseable_manifest_is_not_a_bundle() {
-    let dir = tempfile::tempdir().unwrap();
-    publish(dir.path());
-    std::fs::write(dir.path().join("bloom.toml"), "this is not toml {{{").unwrap();
-    assert!(matches!(
-        Lookup::open(dir.path(), SCHEME),
-        Err(burton::OpenError::Schema(..))
-    ));
-}
-
-#[test]
 fn an_empty_bundle_opens_and_skips_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    build::write_bundle(
+    write_bundle(
         dir.path(),
         &KeySets::new().into_filters(1e-9),
         "2026-08-31",
@@ -257,7 +362,7 @@ fn an_empty_bundle_opens_and_skips_nothing() {
 
     let lk = open(dir.path());
     assert!(lk.is_active(), "the filters exist, they are just empty");
-    assert_eq!(lk.keys(), 0);
+    assert_eq!(lk.key_count(), 0);
     assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
     assert!(!lk.may_skip(&Artifact::purl("pkg:npm/anything@1")));
 }
@@ -266,41 +371,12 @@ fn an_empty_bundle_opens_and_skips_nothing() {
 fn a_v1_bundle_opens_and_folds_sightings_into_bad() {
     let dir = tempfile::tempdir().unwrap();
     let mut sets = KeySets::new();
-    sets.insert(
-        Tier::Good,
-        Record {
-            purl: None,
-            sha256: Some(digest(1)),
-        },
-    );
-    sets.insert(
-        Tier::Bad,
-        Record {
-            purl: None,
-            sha256: Some(digest(2)),
-        },
-    );
-    sets.insert(
-        Tier::SightedHostile,
-        Record {
-            purl: None,
-            sha256: Some(digest(3)),
-        },
-    );
-    sets.insert(
-        Tier::SightedSuspicious,
-        Record {
-            purl: None,
-            sha256: Some(digest(4)),
-        },
-    );
-    build::write_bundle(
-        dir.path(),
-        &sets.into_filters_for(1, 1e-9),
-        "2026-08-31",
-        SCHEME,
-    )
-    .unwrap();
+    sets.insert(Tier::Good, Record::sha256(digest(1)));
+    sets.insert(Tier::Bad, Record::sha256(digest(2)));
+    sets.insert(Tier::SightedHostile, Record::sha256(digest(3)));
+    sets.insert(Tier::SightedSuspicious, Record::sha256(digest(4)));
+    let filters = sets.into_filters_for(1, 1e-9).unwrap();
+    write_bundle(dir.path(), &filters, "2026-08-31", SCHEME).unwrap();
 
     let lk = open(dir.path());
     assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
@@ -344,40 +420,11 @@ fn many_threads_agree_with_one() {
 fn a_self_contradictory_bundle_conflicts_rather_than_blesses() {
     let both = digest(1);
 
-    // Two bundles built separately, each blessing or catalguing the same key.
+    // Two bundles built separately, one blessing and one cataloguing the same key.
     let blessed = tempfile::tempdir().unwrap();
-    let mut sets = KeySets::new();
-    sets.insert(
-        Tier::Good,
-        Record {
-            purl: None,
-            sha256: Some(both),
-        },
-    );
-    build::write_bundle(
-        blessed.path(),
-        &sets.into_filters(1e-9),
-        "2026-08-31",
-        SCHEME,
-    )
-    .unwrap();
-
+    publish_one(blessed.path(), Tier::Good, Record::sha256(both));
     let catalogued = tempfile::tempdir().unwrap();
-    let mut sets = KeySets::new();
-    sets.insert(
-        Tier::Bad,
-        Record {
-            purl: None,
-            sha256: Some(both),
-        },
-    );
-    build::write_bundle(
-        catalogued.path(),
-        &sets.into_filters(1e-9),
-        "2026-08-31",
-        SCHEME,
-    )
-    .unwrap();
+    publish_one(catalogued.path(), Tier::Bad, Record::sha256(both));
 
     // Splice the second bundle's bad filter over the first's, as filters built
     // at different times and shipped together would be.
@@ -392,58 +439,6 @@ fn a_self_contradictory_bundle_conflicts_rather_than_blesses() {
     assert!(!lk.may_skip(&Artifact::sha256(&both)));
 }
 
-/// Error text is what an operator sees when a bundle will not open.
-#[test]
-fn every_open_error_renders() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(
-        !Lookup::open(dir.path(), SCHEME)
-            .unwrap_err()
-            .to_string()
-            .is_empty()
-    );
-
-    publish(dir.path());
-    assert!(
-        Lookup::open(dir.path(), "other/v1")
-            .unwrap_err()
-            .to_string()
-            .contains("other/v1")
-    );
-
-    std::fs::remove_file(dir.path().join("purl-bad.adbl")).unwrap();
-    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
-    assert!(err.to_string().contains("purl-bad.adbl"));
-    assert!(std::error::Error::source(&err).is_some());
-
-    let dir = tempfile::tempdir().unwrap();
-    publish(dir.path());
-    let victim = dir.path().join("sha256-good.adbl");
-    let mut bytes = std::fs::read(&victim).unwrap();
-    bytes.truncate(40);
-    std::fs::write(&victim, bytes).unwrap();
-    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
-    assert!(err.to_string().contains("sha256-good.adbl"), "{err}");
-    assert!(std::error::Error::source(&err).is_some());
-
-    let dir = tempfile::tempdir().unwrap();
-    publish(dir.path());
-    let bad = std::fs::read(dir.path().join("sha256-bad.adbl")).unwrap();
-    std::fs::write(dir.path().join("sha256-good.adbl"), bad).unwrap();
-    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
-    assert!(err.to_string().contains("sha256-bad"), "{err}");
-
-    let dir = tempfile::tempdir().unwrap();
-    publish(dir.path());
-    std::fs::write(dir.path().join("bloom.toml"), "{{{").unwrap();
-    assert!(
-        !Lookup::open(dir.path(), SCHEME)
-            .unwrap_err()
-            .to_string()
-            .is_empty()
-    );
-}
-
 /// An open bundle holds no file, so an updater can swap the directory out from
 /// under it on every platform. Once it is gone, nothing is blessed or convicted.
 #[test]
@@ -456,8 +451,44 @@ fn a_bundle_moved_away_while_open_decides_nothing() {
     assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
 
     std::fs::rename(&dir, root.path().join("old")).unwrap();
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::Unknown);
+    for tag in [1, 2] {
+        assert_eq!(
+            lk.decide(&Artifact::sha256(&digest(tag))),
+            Decision::Unavailable
+        );
+    }
+}
+
+/// A filter that cannot be read blesses nothing, but cannot erase what the
+/// filters that can be read say — for its own key or for another.
+#[test]
+fn an_unreadable_filter_does_not_erase_a_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+    std::fs::remove_file(dir.path().join("purl-good.adbl")).unwrap();
+    std::fs::remove_file(dir.path().join("sha256-sighted-hostile.adbl")).unwrap();
+
+    // The purl's own good filter is gone, and its bad filter still convicts.
+    assert_eq!(lk.decide(&Artifact::purl(CATALOGUED)), Decision::KnownBad);
+    // A digest blessed by a readable filter is not blessed with one missing.
+    assert_eq!(
+        lk.decide(&Artifact::sha256(&digest(1))),
+        Decision::Unavailable
+    );
+    assert_eq!(
+        lk.decide(&Artifact::sha256(&digest(9))),
+        Decision::Unavailable
+    );
+    // One key's broken filters do not hide the other key's claim.
+    assert_eq!(
+        lk.decide(&Artifact::purl(BLESSED).and_sha256(&digest(2))),
+        Decision::KnownBad
+    );
+    assert_eq!(
+        lk.decide(&Artifact::purl(CATALOGUED).and_sha256(&digest(9))),
+        Decision::KnownBad
+    );
 }
 
 /// A bundle replaced while open is read as the replacement: a revocation it
@@ -469,15 +500,7 @@ fn a_revocation_installed_while_open_is_honored() {
     let lk = open(dir.path());
     assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
 
-    let mut sets = KeySets::new();
-    sets.insert(
-        Tier::Bad,
-        Record {
-            purl: None,
-            sha256: Some(digest(1)),
-        },
-    );
-    build::write_bundle(dir.path(), &sets.into_filters(1e-9), "2026-09-01", SCHEME).unwrap();
+    publish_one(dir.path(), Tier::Bad, Record::sha256(digest(1)));
     assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
     assert!(lk.decide(&Artifact::sha256(&digest(1))).is_adverse());
 }
@@ -492,5 +515,8 @@ fn a_filter_relabelled_while_open_decides_nothing() {
 
     let bad = std::fs::read(dir.path().join("sha256-bad.adbl")).unwrap();
     std::fs::write(dir.path().join("sha256-good.adbl"), bad).unwrap();
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
+    assert_eq!(
+        lk.decide(&Artifact::sha256(&digest(1))),
+        Decision::Unavailable
+    );
 }

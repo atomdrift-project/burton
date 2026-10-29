@@ -13,7 +13,7 @@
 //!      8     4  k, hash functions per key
 //!     12     8  m, bits in the array; always a power of two
 //!     20     8  n, keys inserted at build time (informational)
-//!     28     8  seed, reserved; producers write zero
+//!     28     8  reserved, always zero
 //! ```
 //!
 //! The bit array follows, exactly `m / 8` bytes of it.
@@ -32,11 +32,10 @@
 //! # Reading is strict
 //!
 //! [`Filter::load`] rejects rather than interprets: wrong magic, an unknown
-//! version, a tier that version cannot carry, `k` or `m` out of bounds, a bit
-//! array whose length disagrees with the header, or one too full or too
-//! permissive (`fill^k`) for any correctly sized filter to be. The one
-//! guess that matters — is this key blessed? — is the one that must not be
-//! wrong.
+//! version, a tier that version cannot carry, `k` or `m` out of bounds, a
+//! nonzero reserved field, a bit array whose length disagrees with the header,
+//! or one too full or too permissive (`fill^k`) for any correctly sized filter
+//! to be.
 
 use std::fmt;
 use std::fs::File;
@@ -58,7 +57,7 @@ pub const SUPPORTED_VERSIONS: &[u16] = &[2, 1];
 const MAGIC: [u8; 4] = *b"ADBL";
 
 /// Fixed header length in bytes.
-pub(crate) const HEADER_LEN: usize = 36;
+const HEADER_LEN: usize = 36;
 
 /// Upper bound on hash functions per key. Bounds the probe loop and keeps a
 /// corrupt header from producing an absurd amount of work.
@@ -84,7 +83,10 @@ const MAX_EFFECTIVE_FP: f64 = 0.05;
 /// under [`MAX_EFFECTIVE_FP`], so no real build can reach the load bound.
 /// A tiny filter (64 bits, a handful of keys) cannot set enough bits even with
 /// zero collisions, and a large one concentrates near half full.
-const MAX_TARGET_FP: f64 = 1e-3;
+pub(crate) const MAX_TARGET_FP: f64 = 1e-3;
+
+/// Target used when the caller's is not a positive number.
+const FALLBACK_FP: f64 = 1e-9;
 
 /// The category of key a filter holds. Stored in the header so a filter in the
 /// wrong slot is rejected rather than consulted.
@@ -187,7 +189,8 @@ impl Tier {
         }
     }
 
-    /// Dense index, for slot arrays.
+    /// Dense index, for slot arrays. `Good` is first, so the adverse tiers are
+    /// the rest of any slot row.
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::Good => 0,
@@ -277,56 +280,46 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// A format version this build cannot write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedVersion(pub u16);
+
+impl fmt::Display for UnsupportedVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "format v{}, this build writes {SUPPORTED_VERSIONS:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedVersion {}
+
 /// A parsed header: everything about a filter but its bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
     pub(crate) kind: Kind,
     pub(crate) tier: Tier,
-    version: u16,
+    pub(crate) version: u16,
     k: u32,
     m_bits: u64,
     pub(crate) n: u64,
-    seed: u64,
 }
 
 impl Header {
-    /// Parse the header at the start of `bytes`, rejecting any field that is
-    /// structurally invalid. Says nothing about the bits that follow.
-    fn parse(bytes: &[u8]) -> Result<Self, LoadError> {
-        let head = bytes.get(..HEADER_LEN).ok_or(LoadError::Truncated)?;
-        let u16_at = |o: usize| -> u16 {
-            head.get(o..o + 2)
-                .and_then(|s| s.try_into().ok())
-                .map_or(0, u16::from_le_bytes)
-        };
-        let u32_at = |o: usize| -> u32 {
-            head.get(o..o + 4)
-                .and_then(|s| s.try_into().ok())
-                .map_or(0, u32::from_le_bytes)
-        };
-        let u64_at = |o: usize| -> u64 {
-            head.get(o..o + 8)
-                .and_then(|s| s.try_into().ok())
-                .map_or(0, u64::from_le_bytes)
-        };
-
-        if head.get(..4) != Some(&MAGIC) {
+    /// Parse a header, rejecting any field that is structurally invalid. Says
+    /// nothing about the bits that follow.
+    fn parse(head: &[u8; HEADER_LEN]) -> Result<Self, LoadError> {
+        if head[..4] != MAGIC {
             return Err(LoadError::BadMagic);
         }
-        let version = u16_at(4);
+        let version = u16::from_le_bytes(le(head, 4));
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(LoadError::UnsupportedVersion(version));
         }
-        let kind = head
-            .get(6)
-            .copied()
-            .and_then(Kind::from_u8)
-            .ok_or(LoadError::Corrupt("kind"))?;
-        let tier = head
-            .get(7)
-            .copied()
-            .and_then(Tier::from_u8)
-            .ok_or(LoadError::Corrupt("tier"))?;
+        let kind = Kind::from_u8(head[6]).ok_or(LoadError::Corrupt("kind"))?;
+        let tier = Tier::from_u8(head[7]).ok_or(LoadError::Corrupt("tier"))?;
         // A tier the declared version cannot carry means the file is
         // mislabelled, not merely new. Reject rather than pick a field to
         // believe: this catches a v2 filter republished under a v1 name, which
@@ -334,14 +327,16 @@ impl Header {
         if tier.min_format_version() > version {
             return Err(LoadError::Corrupt("tier newer than declared version"));
         }
-
-        let k = u32_at(8);
+        let k = u32::from_le_bytes(le(head, 8));
         if k == 0 || k > MAX_K {
             return Err(LoadError::Corrupt("k out of range"));
         }
-        let m_bits = u64_at(12);
+        let m_bits = u64::from_le_bytes(le(head, 12));
         if m_bits < MIN_BITS || !m_bits.is_power_of_two() {
             return Err(LoadError::Corrupt("m_bits not a power of two >= 64"));
+        }
+        if u64::from_le_bytes(le(head, 28)) != 0 {
+            return Err(LoadError::Corrupt("reserved field is nonzero"));
         }
         Ok(Self {
             kind,
@@ -349,8 +344,7 @@ impl Header {
             version,
             k,
             m_bits,
-            n: u64_at(20),
-            seed: u64_at(28),
+            n: u64::from_le_bytes(le(head, 20)),
         })
     }
 
@@ -366,16 +360,15 @@ impl Header {
     }
 
     fn probes(&self, digest: &[u8; 32]) -> Probes {
-        Probes::new(self.k, self.m_bits, self.seed, digest)
+        Probes::new(self.k, self.m_bits, digest)
     }
 }
 
-/// An immutable, queryable filter.
+/// An immutable filter, as built or as loaded from its on-disk image.
 ///
 /// One buffer holds the whole file image: loading does not copy the bit array
 /// out of it and writing hands it straight back, so a 32 MiB filter costs
 /// 32 MiB once. Membership testing is deliberately not public.
-#[derive(Clone)]
 pub struct Filter {
     /// The whole on-disk image: [`HEADER_LEN`] bytes of header, then the bits.
     bytes: Vec<u8>,
@@ -390,7 +383,7 @@ impl fmt::Debug for Filter {
             .field("k", &self.header.k)
             .field("m_bits", &self.header.m_bits)
             .field("n", &self.header.n)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -425,8 +418,7 @@ impl Filter {
         self.header.n == 0
     }
 
-    /// Canonical artifact stem, e.g. `purl-good`. The one place file names
-    /// are spelled.
+    /// Canonical artifact stem, e.g. `purl-good`.
     #[must_use]
     pub fn stem(&self) -> String {
         self.header.stem()
@@ -439,7 +431,7 @@ impl Filter {
     }
 
     /// Re-stamp for an older bundle, or `None` when this tier did not exist at
-    /// that version.
+    /// that version or the version is not one this build reads.
     ///
     /// `None` rather than a silent downgrade: a `sighted-*` filter has no v1
     /// meaning, and writing one into a v1 bundle hands a client a file it must
@@ -451,8 +443,7 @@ impl Filter {
             return None;
         }
         self.header.version = version;
-        let slot = self.bytes.get_mut(4..6)?;
-        slot.copy_from_slice(&version.to_le_bytes());
+        self.bytes[4..6].copy_from_slice(&version.to_le_bytes());
         Some(self)
     }
 
@@ -463,34 +454,26 @@ impl Filter {
     /// can act on a `good` hit without consulting the adverse tiers.
     pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> bool {
         // `all` short-circuits, so a miss costs about two probes rather than k.
-        // Most queries are misses; this is the hot path.
-        self.header.probes(digest).all(|i| self.bit(i))
-    }
-
-    #[inline]
-    fn bit(&self, idx: usize) -> bool {
-        // idx < m_bits by construction, so the byte is in range; ask anyway.
-        self.bytes
-            .get(HEADER_LEN + (idx >> 3))
-            .is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
+        self.header.probes(digest).all(|i| bit_set(&self.bytes, i))
     }
 
     /// Parse a filter from its on-disk image, taking ownership of the buffer.
+    ///
+    /// This is the full check, bits included, and what an installer should run
+    /// on every downloaded file. [`crate::Lookup::open`] reads only headers.
     ///
     /// # Errors
     /// [`LoadError`] if the buffer is truncated, the magic or version does not
     /// match, a header field is invalid, or the bit array is implausibly full.
     pub fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
-        let header = Header::parse(&bytes)?;
+        let header = Header::parse(bytes.first_chunk().ok_or(LoadError::Truncated)?)?;
         let Header { k, m_bits, .. } = header;
         // The image is the header plus exactly m/8 bytes, no more.
         if bytes.len() as u64 != header.image_len() {
             return Err(LoadError::Truncated);
         }
         // The array is m/8 bytes, a whole number of words, so count by word.
-        let set: u64 = bytes
-            .get(HEADER_LEN..)
-            .unwrap_or_default()
+        let set: u64 = bytes[HEADER_LEN..]
             .as_chunks::<8>()
             .0
             .iter()
@@ -506,7 +489,6 @@ impl Filter {
                 k,
             });
         }
-
         Ok(Self { bytes, header })
     }
 }
@@ -560,8 +542,7 @@ impl OnDisk {
             self.file
                 .seek(SeekFrom::Start(HEADER_LEN as u64 + (idx >> 3) as u64))?;
             self.file.read_exact(&mut byte)?;
-            let [byte] = byte;
-            if byte & (1u8 << (idx & 7)) == 0 {
+            if byte[0] & (1u8 << (idx & 7)) == 0 {
                 return Ok(false);
             }
         }
@@ -574,19 +555,16 @@ impl OnDisk {
 #[derive(Debug)]
 pub(crate) struct Builder {
     bytes: Vec<u8>,
-    kind: Kind,
-    tier: Tier,
-    k: u32,
-    m_bits: u64,
-    n: u64,
+    header: Header,
 }
 
 impl Builder {
     /// Size a builder for `expected` keys at `target_fp` false-positive rate.
     ///
-    /// `target_fp` outside `(0, MAX_TARGET_FP]` falls back to `1e-9`, since a
-    /// looser filter would be refused at load; `expected` is floored at 1 so
-    /// the filter is never zero-bit.
+    /// `target_fp` above [`MAX_TARGET_FP`] is clamped to it, since a looser
+    /// filter would be refused at load; one that is not a positive number
+    /// builds at `1e-9`. `expected` is floored at 1 so the filter is never
+    /// zero-bit.
     ///
     /// `m = -n·ln(p) / (ln 2)²`, rounded up to a power of two so indexing is a
     /// mask. `k` is `log2(1/p)`, the probe count that reaches `p` at the ideal
@@ -595,22 +573,21 @@ impl Builder {
     /// nobody asked for — we cap by it only because it is smaller when rounding
     /// leaves the filter tight.
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        clippy::cast_precision_loss
+        clippy::cast_precision_loss,
+        reason = "inputs are small positive counts and probabilities, and the \
+                  result is bounded by next_power_of_two and clamped"
     )]
-    // Inputs are small positive counts and probabilities, and the result is
-    // bounded by next_power_of_two and clamped, so these conversions are exact
-    // in the range that reaches them.
     pub(crate) fn new(kind: Kind, tier: Tier, expected: u64, target_fp: f64) -> Self {
         const LN2: f64 = std::f64::consts::LN_2;
         let n = expected.max(1);
-        // NaN fails both comparisons, so it falls back too.
-        let p = if target_fp > 0.0 && target_fp <= MAX_TARGET_FP {
-            target_fp
+        // NaN fails the comparison, so it falls back too.
+        let p = if target_fp > 0.0 {
+            target_fp.min(MAX_TARGET_FP)
         } else {
-            1e-9
+            FALLBACK_FP
         };
         let raw_bits = -(n as f64) * p.ln() / (LN2 * LN2);
         let m_bits = (raw_bits.ceil() as u64).max(MIN_BITS).next_power_of_two();
@@ -626,53 +603,46 @@ impl Builder {
         bytes.extend_from_slice(&k.to_le_bytes());
         bytes.extend_from_slice(&m_bits.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes()); // n, patched by build()
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // seed, reserved
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // reserved
         bytes.resize(HEADER_LEN + (m_bits / 8) as usize, 0);
 
         Self {
             bytes,
-            kind,
-            tier,
-            k,
-            m_bits,
-            n: 0,
+            header: Header {
+                kind,
+                tier,
+                version: FORMAT_VERSION,
+                k,
+                m_bits,
+                n: 0,
+            },
         }
     }
 
-    /// Insert a variable-length key.
-    pub(crate) fn insert_key(&mut self, key: &[u8]) {
-        self.insert_digest(&digest_of(key));
-    }
-
-    /// Insert a 32-byte SHA-256 digest directly.
+    /// Insert a 32-byte SHA-256 digest: a [`Kind::Sha256`] key itself, or the
+    /// [`digest_of`] a variable-length key.
     pub(crate) fn insert_digest(&mut self, digest: &[u8; 32]) {
-        for idx in Probes::new(self.k, self.m_bits, 0, digest) {
-            if let Some(byte) = self.bytes.get_mut(HEADER_LEN + (idx >> 3)) {
-                *byte |= 1u8 << (idx & 7);
-            }
+        for idx in self.header.probes(digest) {
+            self.bytes[HEADER_LEN + (idx >> 3)] |= 1u8 << (idx & 7);
         }
-        self.n += 1;
+        self.header.n += 1;
     }
 
     /// Finalize into an immutable [`Filter`].
     #[must_use]
     pub(crate) fn build(mut self) -> Filter {
-        if let Some(slot) = self.bytes.get_mut(20..28) {
-            slot.copy_from_slice(&self.n.to_le_bytes());
-        }
+        self.bytes[20..28].copy_from_slice(&self.header.n.to_le_bytes());
         Filter {
             bytes: self.bytes,
-            header: Header {
-                kind: self.kind,
-                tier: self.tier,
-                version: FORMAT_VERSION,
-                k: self.k,
-                m_bits: self.m_bits,
-                n: self.n,
-                seed: 0,
-            },
+            header: self.header,
         }
     }
+}
+
+/// Whether bit `idx` of an image's array is set. `idx < m_bits` because
+/// [`Probes`] masks it, and the image holds exactly `m_bits / 8` bytes of bits.
+fn bit_set(image: &[u8], idx: usize) -> bool {
+    image[HEADER_LEN + (idx >> 3)] & (1u8 << (idx & 7)) != 0
 }
 
 /// The `k` bit indices for one digest. One derivation shared by insert and
@@ -686,12 +656,13 @@ struct Probes {
 }
 
 impl Probes {
-    fn new(k: u32, m_bits: u64, seed: u64, digest: &[u8; 32]) -> Self {
+    fn new(k: u32, m_bits: u64, digest: &[u8; 32]) -> Self {
+        // Lanes 2 and 3 go unused; 128 bits is ample for double hashing.
         Self {
-            h: lane(digest, 0) ^ seed,
+            h: u64::from_le_bytes(le(digest, 0)),
             // Odd, so it is coprime with the power-of-two modulus and the
             // indices walk every residue instead of a short cycle.
-            step: lane(digest, 1) | 1,
+            step: u64::from_le_bytes(le(digest, 8)) | 1,
             mask: m_bits - 1,
             left: k,
         }
@@ -702,8 +673,11 @@ impl Iterator for Probes {
     type Item = usize;
 
     #[inline]
-    #[allow(clippy::cast_possible_truncation)]
-    // idx < m_bits, which load() bounds to a usize on every target we build for.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "idx < m_bits, and a filter that fits in memory or a file has \
+                  m_bits / 8 within usize"
+    )]
     fn next(&mut self) -> Option<usize> {
         self.left = self.left.checked_sub(1)?;
         let idx = (self.h & self.mask) as usize;
@@ -712,38 +686,37 @@ impl Iterator for Probes {
     }
 }
 
-/// Read 64-bit lane `i` of a digest, little-endian. Lanes 2 and 3 go unused;
-/// 128 bits is ample for double hashing.
-fn lane(d: &[u8; 32], i: usize) -> u64 {
-    d.get(i * 8..i * 8 + 8)
-        .and_then(|s| s.try_into().ok())
-        .map_or(0, u64::from_le_bytes)
+/// The `N` bytes of `bytes` starting at the constant offset `at`.
+fn le<const N: usize, const L: usize>(bytes: &[u8; L], at: usize) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[at..at + N]);
+    out
 }
 
 /// The chance an arbitrary key passes all `k` probes of an array with `set` of
 /// `bits` bits set: `(set / bits)^k`.
-#[allow(clippy::cast_precision_loss)]
-// Bit counts are far below 2^53, where u64 to f64 is exact; k <= MAX_K.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bit counts are far below 2^53, where u64 to f64 is exact"
+)]
 fn effective_fp(set: u64, bits: u64, k: u32) -> f64 {
     (set as f64 / bits as f64).powi(i32::try_from(k).unwrap_or(i32::MAX))
 }
 
 /// SHA-256 of a variable-length key.
 pub(crate) fn digest_of(key: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(key));
-    out
+    Sha256::digest(key).into()
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn build(keys: &[&str], fp: f64) -> Filter {
         let mut b = Builder::new(Kind::Purl, Tier::Good, keys.len() as u64, fp);
         for k in keys {
-            b.insert_key(k.as_bytes());
+            b.insert_digest(&digest_of(k.as_bytes()));
         }
         b.build()
     }
@@ -779,22 +752,8 @@ mod tests {
     }
 
     #[test]
-    fn a_nonsense_target_falls_back_to_a_safe_default() {
-        for fp in [0.0, 1.0, -1.0, f64::NAN, f64::INFINITY] {
-            let f = build(&["a"], fp);
-            assert_eq!(f.header.k, 30, "fp={fp} should fall back to 1e-9");
-        }
-    }
-
-    /// A target too loose for `load` to accept is a nonsense target too.
-    #[test]
-    fn a_target_past_the_cap_falls_back() {
-        assert_eq!(
-            build(&["a"], MAX_TARGET_FP).header.k,
-            10,
-            "the cap is honoured"
-        );
-        for fp in [MAX_TARGET_FP * 1.01, 1e-2, 0.5] {
+    fn a_nonpositive_target_falls_back_to_a_safe_default() {
+        for fp in [0.0, -1.0, f64::NAN, f64::NEG_INFINITY] {
             assert_eq!(
                 build(&["a"], fp).header.k,
                 30,
@@ -803,30 +762,31 @@ mod tests {
         }
     }
 
+    /// A target too loose for `load` to accept is clamped to the loosest one
+    /// it would, not replaced by a far tighter one.
     #[test]
-    fn debug_and_display_render() {
-        let f = build(&["a"], 1e-9);
-        let shown = format!("{f:?}");
-        assert!(shown.contains("purl-good"), "{shown}");
-        assert!(
-            !shown.contains("bytes"),
-            "the bit array must not be printed"
-        );
-
-        for e in [
-            LoadError::Truncated,
-            LoadError::BadMagic,
-            LoadError::UnsupportedVersion(7),
-            LoadError::Corrupt("kind"),
-            LoadError::Overfull { set: 64, bits: 64 },
-            LoadError::ImplausibleFalsePositiveRate {
-                set: 47,
-                bits: 64,
-                k: 1,
-            },
+    fn a_target_past_the_cap_is_clamped() {
+        for fp in [
+            MAX_TARGET_FP,
+            MAX_TARGET_FP * 1.01,
+            1e-2,
+            0.5,
+            1.0,
+            f64::INFINITY,
         ] {
-            assert!(!e.to_string().is_empty(), "{e:?}");
+            assert_eq!(
+                build(&["a"], fp).header.k,
+                10,
+                "fp={fp} should clamp to 1e-3"
+            );
         }
+    }
+
+    #[test]
+    fn debug_never_prints_the_bit_array() {
+        let shown = format!("{:?}", build(&["a"], 1e-9));
+        assert!(shown.contains("purl-good"), "{shown}");
+        assert!(!shown.contains("bytes"), "{shown}");
     }
 
     #[test]
@@ -843,60 +803,37 @@ mod tests {
     #[test]
     fn rejects_what_it_does_not_understand() {
         let good = build(&["x"], 1e-9).as_bytes().to_vec();
+        let with = |at: usize, patch: &[u8]| {
+            let mut bytes = good.clone();
+            bytes[at..at + patch.len()].copy_from_slice(patch);
+            Filter::load(bytes).err()
+        };
 
         assert_eq!(Filter::load(vec![0; 4]).err(), Some(LoadError::Truncated));
-
-        let mut bad_magic = good.clone();
-        bad_magic.get_mut(0..4).unwrap().copy_from_slice(b"XXXX");
-        assert_eq!(Filter::load(bad_magic).err(), Some(LoadError::BadMagic));
-
-        let mut bad_ver = good.clone();
-        bad_ver
-            .get_mut(4..6)
-            .unwrap()
-            .copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(with(0, b"XXXX"), Some(LoadError::BadMagic));
         assert_eq!(
-            Filter::load(bad_ver).err(),
+            with(4, &99u16.to_le_bytes()),
             Some(LoadError::UnsupportedVersion(99))
         );
-
-        let mut retired_kind = good.clone();
-        *retired_kind.get_mut(6).unwrap() = 2; // the withdrawn `url` kind
+        // 2 is the withdrawn `url` kind, 3 the withdrawn `unknown-clean` tier.
+        assert_eq!(with(6, &[2]), Some(LoadError::Corrupt("kind")));
+        assert_eq!(with(7, &[3]), Some(LoadError::Corrupt("tier")));
         assert_eq!(
-            Filter::load(retired_kind).err(),
-            Some(LoadError::Corrupt("kind"))
-        );
-
-        let mut retired_tier = good.clone();
-        *retired_tier.get_mut(7).unwrap() = 3; // the withdrawn `unknown-clean`
-        assert_eq!(
-            Filter::load(retired_tier).err(),
-            Some(LoadError::Corrupt("tier"))
-        );
-
-        let mut short = good.clone();
-        short.truncate(HEADER_LEN + 1);
-        assert_eq!(Filter::load(short).err(), Some(LoadError::Truncated));
-
-        let mut zero_k = good.clone();
-        zero_k
-            .get_mut(8..12)
-            .unwrap()
-            .copy_from_slice(&0u32.to_le_bytes());
-        assert_eq!(
-            Filter::load(zero_k).err(),
+            with(8, &0u32.to_le_bytes()),
             Some(LoadError::Corrupt("k out of range"))
         );
-
-        let mut tiny_m = good;
-        tiny_m
-            .get_mut(12..20)
-            .unwrap()
-            .copy_from_slice(&8u64.to_le_bytes());
         assert!(matches!(
-            Filter::load(tiny_m).err(),
+            with(12, &8u64.to_le_bytes()),
             Some(LoadError::Corrupt(_))
         ));
+        assert_eq!(
+            with(28, &1u64.to_le_bytes()),
+            Some(LoadError::Corrupt("reserved field is nonzero"))
+        );
+
+        let mut short = good;
+        short.truncate(HEADER_LEN + 1);
+        assert_eq!(Filter::load(short).err(), Some(LoadError::Truncated));
     }
 
     #[test]
@@ -904,10 +841,7 @@ mod tests {
         let mut b = Builder::new(Kind::Sha256, Tier::SightedHostile, 1, 1e-9);
         b.insert_digest(&[7u8; 32]);
         let mut bytes = b.build().as_bytes().to_vec();
-        bytes
-            .get_mut(4..6)
-            .unwrap()
-            .copy_from_slice(&1u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
         assert_eq!(
             Filter::load(bytes).err(),
             Some(LoadError::Corrupt("tier newer than declared version"))
@@ -973,7 +907,7 @@ mod tests {
             let hits = (0..trials)
                 .filter(|i| f.may_contain(&digest_of(format!("out-{n}-{i}").as_bytes())))
                 .count();
-            let observed = f64::from(u32::try_from(hits).unwrap_or(u32::MAX)) / f64::from(trials);
+            let observed = f64::from(u32::try_from(hits).unwrap()) / f64::from(trials);
             // Generous headroom: this is a sanity bound, not a distribution test.
             assert!(observed <= p * 10.0, "n={n} p={p}: observed {observed}");
         }
@@ -988,9 +922,7 @@ mod tests {
         for i in 0..good.len() {
             for mask in [0x01u8, 0x80, 0xff] {
                 let mut bytes = good.clone();
-                if let Some(b) = bytes.get_mut(i) {
-                    *b ^= mask;
-                }
+                bytes[i] ^= mask;
                 // Must not panic. Either outcome is acceptable.
                 if let Ok(f) = Filter::load(bytes) {
                     let _ = f.may_contain(&[0u8; 32]);
@@ -1016,9 +948,7 @@ mod tests {
     #[test]
     fn an_absurd_m_is_rejected_not_allocated() {
         let mut bytes = build(&["x"], 1e-9).as_bytes().to_vec();
-        if let Some(slot) = bytes.get_mut(12..20) {
-            slot.copy_from_slice(&(1u64 << 62).to_le_bytes());
-        }
+        bytes[12..20].copy_from_slice(&(1u64 << 62).to_le_bytes());
         assert_eq!(Filter::load(bytes).err(), Some(LoadError::Truncated));
     }
 
@@ -1090,8 +1020,7 @@ mod tests {
     }
 
     /// Real filters, at realistic sizes and every target in use, stay well
-    /// clear of the ceiling. 1e-2 is past [`MAX_TARGET_FP`] and builds at the
-    /// fallback.
+    /// clear of the ceiling. 1e-2 is past [`MAX_TARGET_FP`] and is clamped.
     #[test]
     fn real_filters_load() {
         for (n, p) in [
