@@ -418,8 +418,10 @@ pub enum VerifyError {
     Ratio {
         /// The filter's stem.
         stem: String,
-        /// What happened, in words.
-        detail: String,
+        /// How many keys it held last build.
+        was: u64,
+        /// How many it holds now.
+        now: u64,
     },
 }
 
@@ -433,7 +435,17 @@ impl fmt::Display for VerifyError {
             Self::Collapsed { stem, was } => {
                 write!(f, "{stem} collapsed to 0 keys (was {was})")
             }
-            Self::Ratio { stem, detail } => write!(f, "{stem} {detail}"),
+            Self::Ratio { stem, was, now } if now < was => write!(
+                f,
+                "{stem} shrank to {now} keys from {was} ({:.0}% of previous, floor {:.0}%)",
+                ratio(*now, *was) * 100.0,
+                MAX_SHRINK * 100.0
+            ),
+            Self::Ratio { stem, was, now } => write!(
+                f,
+                "{stem} grew to {now} keys from {was} ({:.1}x previous, ceiling {MAX_GROWTH:.1}x)",
+                ratio(*now, *was)
+            ),
         }
     }
 }
@@ -458,7 +470,7 @@ pub fn verify(
     filters: &[Filter],
     prev: Option<&Manifest>,
     vouched: &[(String, [u8; 32])],
-    ratio: Ratio,
+    policy: Ratio,
 ) -> Result<Vec<VerifyError>, VerifyError> {
     let digests = |tier: Tier| {
         filters
@@ -502,28 +514,22 @@ pub fn verify(
         if was < RATIO_FLOOR {
             continue;
         }
-        #[expect(clippy::cast_precision_loss, reason = "key counts are far below 2^53")]
-        let ratio_now = now as f64 / was as f64;
-        let detail = if ratio_now < MAX_SHRINK {
-            format!(
-                "shrank to {now} keys from {was} ({:.0}% of previous, floor {:.0}%)",
-                ratio_now * 100.0,
-                MAX_SHRINK * 100.0
-            )
-        } else if ratio_now > MAX_GROWTH {
-            format!(
-                "grew to {now} keys from {was} ({ratio_now:.1}x previous, ceiling {MAX_GROWTH:.1}x)"
-            )
-        } else {
+        if (MAX_SHRINK..=MAX_GROWTH).contains(&ratio(now, was)) {
             continue;
-        };
-        let breach = VerifyError::Ratio { stem, detail };
-        match ratio {
+        }
+        let breach = VerifyError::Ratio { stem, was, now };
+        match policy {
             Ratio::Waive => waived.push(breach),
             Ratio::Enforce => return Err(breach),
         }
     }
     Ok(waived)
+}
+
+/// `now` as a fraction of `was`.
+#[expect(clippy::cast_precision_loss, reason = "key counts are far below 2^53")]
+fn ratio(now: u64, was: u64) -> f64 {
+    now as f64 / was as f64
 }
 
 #[cfg(test)]
@@ -871,10 +877,15 @@ n = 7
         let prev = baseline(&[("sha256-bad", 2_000)]);
         let grown = sets(&many).into_filters(1e-9); // 8000/2000 = 4x
         let err = verify(&grown, Some(&prev), &[], Ratio::Enforce).unwrap_err();
-        let VerifyError::Ratio { detail, .. } = &err else {
+        let VerifyError::Ratio {
+            was: 2_000,
+            now: 8_000,
+            ..
+        } = &err
+        else {
             panic!("expected a ratio breach, got {err:?}");
         };
-        assert!(detail.contains("grew to"), "{detail}");
+        assert!(err.to_string().contains("grew to 8000"), "{err}");
 
         // In band: 3000 from 2000 is 1.5x.
         let mid: Vec<(Tier, Record)> = many.into_iter().take(3_000).collect();

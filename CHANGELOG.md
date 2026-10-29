@@ -21,11 +21,11 @@ First public release.
 - Every filter is consulted for every key and the worst claim wins. A filter
   that cannot be read blesses nothing but no longer erases another filter's
   claim; with no claim, the result is the new `Decision::Unavailable`.
-- On Unix an open `Lookup` holds its filters open and checks the manifest's
-  identity once per decision, reopening the bundle whole when it has been
-  replaced: a decision costs a `stat` and positional reads instead of opening
-  every filter, and always reads a single build. Other platforms still reopen
-  the filters per decision, so no handle blocks an updater.
+- An open `Lookup` checks the manifest's identity once per decision and
+  reopens the bundle whole when it has been replaced. On Unix it holds its
+  filters open, so a decision costs a `stat` and positional reads instead of
+  opening every filter, and always reads a single build. Other platforms still
+  reopen the filters per decision, so no handle blocks an updater.
 - `write_bundle` writes each file to a temporary name, syncs, and renames it
   into place, with the manifest last.
 - `verify` refuses a vouched digest found in any adverse tier, not only `bad`.
@@ -53,4 +53,7 @@ First public release.
   `OpenError::KeyScheme`.
 - `Lookup::keys` is renamed `Lookup::key_count`.
 - `Record::purl` and `Record::sha256` constructors.
+- `Display` for `Kind`, `Tier`, and `Decision`; `Default` for `Lookup`.
+- `VerifyError::Ratio` carries the key counts (`was`, `now`) rather than a
+  preformatted message; its `Display` text is unchanged.
 - `hex` is no longer public. `Filter` is no longer `Clone`.

@@ -75,29 +75,22 @@ impl Bench {
             return;
         }
 
-        // Calibrate: enough calls per round to make timer resolution noise.
-        let mut iters = 1usize;
-        loop {
+        // Inputs are made before the clock starts, so setup is never timed.
+        let mut round = |iters: usize| {
             let inputs: Vec<S> = (0..iters).map(|_| setup()).collect();
             let start = Instant::now();
             for input in inputs {
                 black_box(run(black_box(input)));
             }
-            if start.elapsed() >= ROUND || iters >= 1 << 20 {
-                break;
-            }
+            start.elapsed()
+        };
+        // Enough calls per round that timer resolution is noise.
+        let mut iters = 1usize;
+        while round(iters) < ROUND && iters < 1 << 20 {
             iters *= 2;
         }
-
         let mut samples: Vec<f64> = (0..ROUNDS)
-            .map(|_| {
-                let inputs: Vec<S> = (0..iters).map(|_| setup()).collect();
-                let start = Instant::now();
-                for input in inputs {
-                    black_box(run(black_box(input)));
-                }
-                start.elapsed().as_nanos() as f64 / (iters as f64 * ops as f64)
-            })
+            .map(|_| round(iters).as_nanos() as f64 / (iters as f64 * ops as f64))
             .collect();
         samples.sort_by(f64::total_cmp);
 

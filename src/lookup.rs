@@ -2,9 +2,11 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::time::SystemTime;
 
 use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, load_manifest};
 use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of};
@@ -81,6 +83,12 @@ impl Decision {
 
     const fn is_blessed(self) -> bool {
         matches!(self, Self::Skip | Self::Conflicted)
+    }
+}
+
+impl fmt::Display for Decision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -199,14 +207,14 @@ impl<'a> Artifact<'a> {
 /// reads only the few bytes its probes touch, so a bundle costs no memory for
 /// its bits.
 ///
-/// An open bundle follows its directory. On Unix the filter files are held
-/// open, and each decision checks the manifest's identity — a single `stat` —
-/// and reopens the whole bundle when it has been replaced, as [`write_bundle`]
-/// and a directory swap both do. Decisions therefore always read one build. A
-/// replacement that will not open yields [`Decision::Unavailable`] until one
-/// does. Elsewhere no handle is held between decisions, so an updater can
-/// rename the directory out from under an open bundle; each decision reopens
-/// the filters it consults instead.
+/// An open bundle follows its directory. Each decision checks the manifest's
+/// identity — a single `stat` — and reopens the whole bundle when it has been
+/// replaced, as [`write_bundle`] and a directory swap both do. A replacement
+/// that will not open yields [`Decision::Unavailable`] until one does. On Unix
+/// the filter files are held open, so decisions always read one build.
+/// Elsewhere no handle is held between decisions, so an updater can rename the
+/// directory out from under an open bundle; each decision reopens the filters
+/// it consults instead.
 ///
 /// [`write_bundle`]: crate::write_bundle
 #[derive(Debug)]
@@ -227,7 +235,7 @@ struct Source {
 }
 
 /// One opened build of a bundle.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Generation {
     /// `slots[kind][tier]`, so no tier can be reached except by index.
     slots: [[Option<Slot>; Tier::ALL.len()]; Kind::ALL.len()],
@@ -298,25 +306,26 @@ impl Slot {
     }
 }
 
-/// What tells one manifest file from its replacement.
-#[cfg(unix)]
+/// What tells one manifest file from its replacement. A rename gives the path
+/// a new inode; an in-place rewrite a new length or modification time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
-    dev: u64,
-    ino: u64,
     len: u64,
-    mtime: (i64, i64),
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
 }
 
-#[cfg(unix)]
 impl FileId {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
+    fn of(meta: &Metadata) -> Self {
         Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-            len: meta.size(),
-            mtime: (meta.mtime(), meta.mtime_nsec()),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            },
         }
     }
 
@@ -325,31 +334,7 @@ impl FileId {
     }
 }
 
-/// Elsewhere the manifest is not watched: slots reopen their files instead.
-#[cfg(not(unix))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileId;
-
-#[cfg(not(unix))]
-impl FileId {
-    const fn of(_: &std::fs::Metadata) -> Self {
-        Self
-    }
-
-    #[expect(clippy::unnecessary_wraps, reason = "mirrors the Unix version")]
-    const fn now(_: &Path) -> Option<Self> {
-        Some(Self)
-    }
-}
-
 impl Generation {
-    fn empty() -> Self {
-        Self {
-            slots: Default::default(),
-            manifest: None,
-        }
-    }
-
     /// Open the bundle in `dir`: the rules of [`Lookup::open`].
     fn open(dir: &Path, scheme: &str) -> Result<(Self, Option<String>), OpenError> {
         let (manifest, meta) = load_manifest(dir)?;
@@ -367,32 +352,29 @@ impl Generation {
             slots: Default::default(),
             manifest: Some(FileId::of(&meta)),
         };
-        for (stem, entry) in &manifest.filter {
-            let file = &entry.file;
-            if Path::new(file).file_name() != Some(OsStr::new(file)) {
-                return Err(OpenError::UnsafePath { file: file.clone() });
+        for (stem, entry) in manifest.filter {
+            let file = entry.file;
+            if Path::new(&file).file_name() != Some(OsStr::new(&file)) {
+                return Err(OpenError::UnsafePath { file });
             }
-            let path = dir.join(file);
+            let path = dir.join(&file);
             let filter = match OnDisk::open(&path) {
                 Ok(filter) => filter,
                 Err(OnDiskError::Io(source)) => return Err(OpenError::Io { path, source }),
                 Err(OnDiskError::Invalid(source)) => {
-                    return Err(OpenError::Invalid {
-                        file: file.clone(),
-                        source,
-                    });
+                    return Err(OpenError::Invalid { file, source });
                 }
             };
             let header = *filter.header();
-            if header.stem() != *stem {
+            if !header.has_stem(&stem) {
                 return Err(OpenError::Mislabelled {
-                    file: file.clone(),
+                    file,
                     claims: header.stem(),
                 });
             }
             if header.version != entry.format_version {
                 return Err(OpenError::VersionMismatch {
-                    file: file.clone(),
+                    file,
                     manifest: entry.format_version,
                     header: header.version,
                 });
@@ -464,7 +446,7 @@ impl Lookup {
     pub fn empty() -> Self {
         Self {
             source: None,
-            current: RwLock::new(Generation::empty()),
+            current: RwLock::default(),
             scheme: None,
         }
     }
@@ -558,6 +540,13 @@ impl Lookup {
         // Nothing panics while holding the lock, and a generation is replaced
         // whole, so a poisoned one is still consistent.
         self.current.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// [`Lookup::empty`].
+impl Default for Lookup {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 

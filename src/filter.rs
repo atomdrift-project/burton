@@ -120,12 +120,9 @@ impl Kind {
         }
     }
 
-    /// Dense index, for slot arrays.
+    /// Dense index, for slot arrays: declaration order.
     pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Purl => 0,
-            Self::Sha256 => 1,
-        }
+        self as usize
     }
 
     /// Lowercase slug used in artifact file names.
@@ -135,6 +132,12 @@ impl Kind {
             Self::Purl => "purl",
             Self::Sha256 => "sha256",
         }
+    }
+}
+
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -189,15 +192,10 @@ impl Tier {
         }
     }
 
-    /// Dense index, for slot arrays. `Good` is first, so the adverse tiers are
-    /// the rest of any slot row.
+    /// Dense index, for slot arrays: declaration order. `Good` is first, so the
+    /// adverse tiers are the rest of any slot row.
     pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Good => 0,
-            Self::Bad => 1,
-            Self::SightedHostile => 2,
-            Self::SightedSuspicious => 3,
-        }
+        self as usize
     }
 
     /// Lowercase slug used in artifact file names.
@@ -219,6 +217,12 @@ impl Tier {
             Self::Good | Self::Bad => 1,
             Self::SightedHostile | Self::SightedSuspicious => 2,
         }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -314,7 +318,7 @@ impl Header {
         if head[..4] != MAGIC {
             return Err(LoadError::BadMagic);
         }
-        let version = u16::from_le_bytes(le(head, 4));
+        let version = u16::from_le_bytes(bytes_at(head, 4));
         if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(LoadError::UnsupportedVersion(version));
         }
@@ -327,15 +331,15 @@ impl Header {
         if tier.min_format_version() > version {
             return Err(LoadError::Corrupt("tier newer than declared version"));
         }
-        let k = u32::from_le_bytes(le(head, 8));
+        let k = u32::from_le_bytes(bytes_at(head, 8));
         if k == 0 || k > MAX_K {
             return Err(LoadError::Corrupt("k out of range"));
         }
-        let m_bits = u64::from_le_bytes(le(head, 12));
+        let m_bits = u64::from_le_bytes(bytes_at(head, 12));
         if m_bits < MIN_BITS || !m_bits.is_power_of_two() {
             return Err(LoadError::Corrupt("m_bits not a power of two >= 64"));
         }
-        if u64::from_le_bytes(le(head, 28)) != 0 {
+        if u64::from_le_bytes(bytes_at(head, 28)) != 0 {
             return Err(LoadError::Corrupt("reserved field is nonzero"));
         }
         Ok(Self {
@@ -344,7 +348,7 @@ impl Header {
             version,
             k,
             m_bits,
-            n: u64::from_le_bytes(le(head, 20)),
+            n: u64::from_le_bytes(bytes_at(head, 20)),
         })
     }
 
@@ -356,7 +360,14 @@ impl Header {
     /// Canonical artifact stem, e.g. `purl-good`. The one place file names
     /// are spelled.
     pub(crate) fn stem(&self) -> String {
-        format!("{}-{}", self.kind.as_str(), self.tier.as_str())
+        format!("{}-{}", self.kind, self.tier)
+    }
+
+    /// Whether `stem` is this header's [`Self::stem`], without building it.
+    pub(crate) fn has_stem(&self, stem: &str) -> bool {
+        stem.strip_prefix(self.kind.as_str())
+            .and_then(|rest| rest.strip_prefix('-'))
+            == Some(self.tier.as_str())
     }
 
     fn probes(&self, digest: &[u8; 32]) -> Probes {
@@ -682,10 +693,10 @@ impl Probes {
     fn new(k: u32, m_bits: u64, digest: &[u8; 32]) -> Self {
         // Lanes 2 and 3 go unused; 128 bits is ample for double hashing.
         Self {
-            h: u64::from_le_bytes(le(digest, 0)),
+            h: u64::from_le_bytes(bytes_at(digest, 0)),
             // Odd, so it is coprime with the power-of-two modulus and the
             // indices walk every residue instead of a short cycle.
-            step: u64::from_le_bytes(le(digest, 8)) | 1,
+            step: u64::from_le_bytes(bytes_at(digest, 8)) | 1,
             mask: m_bits - 1,
             left: k,
         }
@@ -710,7 +721,7 @@ impl Iterator for Probes {
 }
 
 /// The `N` bytes of `bytes` starting at the constant offset `at`.
-fn le<const N: usize, const L: usize>(bytes: &[u8; L], at: usize) -> [u8; N] {
+fn bytes_at<const N: usize, const L: usize>(bytes: &[u8; L], at: usize) -> [u8; N] {
     let mut out = [0u8; N];
     out.copy_from_slice(&bytes[at..at + N]);
     out
