@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::build::{MANIFEST_FILE, Manifest};
-use crate::filter::{Filter, Kind, LoadError, Tier, digest_of};
+use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of};
 
 /// What to do with an artifact before spending real work on it.
 ///
@@ -179,13 +179,42 @@ impl<'a> Artifact<'a> {
     }
 }
 
-/// A loaded bundle. Open it once and share it; filters live in memory, so a
-/// bundle costs what its files cost on disk.
+/// An opened bundle. Open it once and share it.
+///
+/// Filters stay on disk. A decision opens the filters it consults and reads
+/// the few bytes its probes touch, so a bundle costs no memory for its bits,
+/// and no handle is held between decisions: an updater may replace the bundle
+/// while it is open, on every platform.
 #[derive(Debug)]
 pub struct Lookup {
     /// `slots[kind][tier]`, so no tier can be reached except by index.
-    slots: [[Option<Filter>; Tier::ALL.len()]; Kind::ALL.len()],
+    slots: [[Option<Slot>; Tier::ALL.len()]; Kind::ALL.len()],
     scheme: Option<String>,
+}
+
+/// One filter of an opened bundle: where it is, and what it was at open.
+#[derive(Debug)]
+struct Slot {
+    path: PathBuf,
+    header: Header,
+}
+
+impl Slot {
+    /// Possible membership, read from disk. `None` when the filter cannot be
+    /// read now, or is no longer the filter this slot was opened as.
+    ///
+    /// The file may belong to a newer build than the one opened, if the
+    /// bundle was replaced in between, and one decision may read filters from
+    /// both. That never yields a skip neither build would give: a claim from
+    /// either build denies it, and a blessing must come from a good filter.
+    fn may_contain(&self, digest: &[u8; 32]) -> Option<bool> {
+        let mut filter = OnDisk::open(&self.path).ok()?;
+        let now = filter.header();
+        if (now.kind, now.tier) != (self.header.kind, self.header.tier) {
+            return None;
+        }
+        filter.may_contain(digest).ok()
+    }
 }
 
 impl Lookup {
@@ -210,8 +239,11 @@ impl Lookup {
     /// consumer that disagree would otherwise match nothing, silently and
     /// forever. A bundle recording none predates the field and is accepted.
     ///
-    /// Manifest digests are not re-verified here. They authenticate a download;
-    /// re-hashing the whole bundle on every open costs more than it catches.
+    /// Manifest digests are not re-verified here, and the bit arrays are not
+    /// read: each filter's header and length are checked, and its bits are
+    /// read only as decisions probe them. Digests authenticate a download, and
+    /// [`crate::Filter::load`]'s fill checks belong to whoever installs it;
+    /// repeating either on every open costs more than it catches.
     ///
     /// # Errors
     /// [`OpenError`] for a missing or unparseable manifest, a scheme mismatch,
@@ -235,18 +267,22 @@ impl Lookup {
 
         let mut me = Self::empty();
         for (stem, entry) in &manifest.filter {
-            let bytes = std::fs::read(dir.join(&entry.file))
-                .map_err(|e| OpenError::Missing(entry.file.clone(), e))?;
-            let filter =
-                Filter::load(bytes).map_err(|e| OpenError::Invalid(entry.file.clone(), e))?;
-            if &filter.stem() != stem {
+            let path = dir.join(&entry.file);
+            let header = match OnDisk::open(&path) {
+                Ok(filter) => *filter.header(),
+                Err(OnDiskError::Io(e)) => return Err(OpenError::Missing(entry.file.clone(), e)),
+                Err(OnDiskError::Invalid(e)) => {
+                    return Err(OpenError::Invalid(entry.file.clone(), e));
+                }
+            };
+            if &header.stem() != stem {
                 return Err(OpenError::Mislabelled {
                     file: entry.file.clone(),
-                    claims: filter.stem(),
+                    claims: header.stem(),
                 });
             }
-            if let Some(slot) = me.slot_mut(filter.kind(), filter.tier()) {
-                *slot = Some(filter);
+            if let Some(slot) = me.slot_mut(header.kind, header.tier) {
+                *slot = Some(Slot { path, header });
             }
         }
         me.scheme = manifest.key_scheme;
@@ -254,13 +290,17 @@ impl Lookup {
     }
 
     /// The verdict for one artifact: every tier consulted for every key, worst
-    /// claim wins, a blessing needs unanimity.
+    /// claim wins, a blessing needs unanimity. A filter that cannot be read
+    /// when consulted decides nothing: the artifact is [`Decision::Unknown`].
     pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
         let purl = artifact
             .purl
             .map(|p| self.decide_key(Kind::Purl, &digest_of(p.as_bytes())));
         let sha256 = artifact.sha256.map(|d| self.decide_key(Kind::Sha256, d));
-        combine(purl.into_iter().chain(sha256))
+        purl.into_iter()
+            .chain(sha256)
+            .collect::<Option<Vec<_>>>()
+            .map_or(Decision::Unknown, |keys| combine(keys.into_iter()))
     }
 
     /// Whether this artifact may be skipped.
@@ -275,10 +315,10 @@ impl Lookup {
         self.filters().next().is_some()
     }
 
-    /// Total keys across every loaded filter.
+    /// Total keys across every loaded filter, as recorded when it was opened.
     #[must_use]
     pub fn keys(&self) -> u64 {
-        self.filters().map(Filter::len).sum()
+        self.filters().map(|slot| slot.header.n).sum()
     }
 
     /// The key scheme this bundle recorded, if it recorded one.
@@ -293,35 +333,43 @@ impl Lookup {
     /// revocation channel. A missing *sighted* filter is not the same failure —
     /// that is a bundle predating those tiers, and [`Lookup::open`] has already
     /// ruled out anything missing by accident.
-    fn decide_key(&self, kind: Kind, digest: &[u8; 32]) -> Decision {
-        let hit = |tier: Tier| self.slot(kind, tier).is_some_and(|f| f.may_contain(digest));
-        let adverse = ADVERSE
-            .iter()
-            .find(|(tier, _)| hit(*tier))
-            .map(|(_, verdict)| *verdict);
+    ///
+    /// `None` when a filter it consults cannot be read.
+    fn decide_key(&self, kind: Kind, digest: &[u8; 32]) -> Option<Decision> {
+        let hit = |tier: Tier| {
+            self.slot(kind, tier)
+                .map_or(Some(false), |slot| slot.may_contain(digest))
+        };
+        let mut adverse = None;
+        for (tier, verdict) in ADVERSE {
+            if hit(tier)? {
+                adverse = Some(verdict);
+                break;
+            }
+        }
 
-        match (adverse, hit(Tier::Good)) {
+        Some(match (adverse, hit(Tier::Good)?) {
             (Some(_), true) => Decision::Conflicted,
             (Some(worst), false) => worst,
             (None, true) if self.slot(kind, Tier::Bad).is_some() => Decision::Skip,
             (None, _) => Decision::Unknown,
-        }
+        })
     }
 
-    fn slot(&self, kind: Kind, tier: Tier) -> Option<&Filter> {
+    fn slot(&self, kind: Kind, tier: Tier) -> Option<&Slot> {
         self.slots
             .get(kind.index())
             .and_then(|row| row.get(tier.index()))
             .and_then(Option::as_ref)
     }
 
-    fn slot_mut(&mut self, kind: Kind, tier: Tier) -> Option<&mut Option<Filter>> {
+    fn slot_mut(&mut self, kind: Kind, tier: Tier) -> Option<&mut Option<Slot>> {
         self.slots
             .get_mut(kind.index())
             .and_then(|row| row.get_mut(tier.index()))
     }
 
-    fn filters(&self) -> impl Iterator<Item = &Filter> {
+    fn filters(&self) -> impl Iterator<Item = &Slot> {
         self.slots.iter().flatten().filter_map(Option::as_ref)
     }
 }

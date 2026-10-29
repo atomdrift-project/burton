@@ -89,6 +89,9 @@ impl KeySets {
     /// because they fail differently: subtraction cannot help when the files on
     /// disk were built at different times, and the query-time rule cannot shrink
     /// a filter that already carries a key it should not.
+    ///
+    /// `target_fp` must lie in `(0, 1e-3]`; anything else builds at `1e-9`.
+    /// A looser filter would fail [`Filter::load`]'s false-positive bound.
     #[must_use]
     pub fn into_filters(mut self, target_fp: f64) -> Vec<Filter> {
         self.subtract_claims_from_good();

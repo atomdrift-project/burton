@@ -33,10 +33,15 @@
 //!
 //! [`Filter::load`] rejects rather than interprets: wrong magic, an unknown
 //! version, a tier that version cannot carry, `k` or `m` out of bounds, a bit
-//! array whose length disagrees with the header. The one guess that matters —
-//! is this key blessed? — is the one that must not be wrong.
+//! array whose length disagrees with the header, or one too full or too
+//! permissive (`fill^k`) for any correctly sized filter to be. The one
+//! guess that matters — is this key blessed? — is the one that must not be
+//! wrong.
 
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -62,6 +67,24 @@ const MAX_K: u32 = 64;
 /// Smallest bit array a filter may declare. Below this, `m / 8` rounds to a
 /// byte count that cannot hold the array the header describes.
 const MIN_BITS: u64 = 64;
+
+/// Highest percentage of set bits a filter may carry. [`Builder::new`] picks k
+/// for its m, so a real filter sits near half full. An arbitrary key passes
+/// with probability `fill^k`, so a forged all-ones array would bless
+/// everything.
+const MAX_FILL_PERCENT: u64 = 75;
+
+/// Highest effective false-positive rate a loaded filter may have: `fill^k`,
+/// the chance an arbitrary key passes every probe. The header's `k` is as
+/// forgeable as the bits, so the fill ceiling alone is not enough: `k = 1` at
+/// 74% fill would bless 74% of all keys.
+const MAX_EFFECTIVE_FP: f64 = 0.05;
+
+/// Loosest target false-positive rate [`Builder::new`] honours. It sits 50x
+/// under [`MAX_EFFECTIVE_FP`], so no real build can reach the load bound.
+/// A tiny filter (64 bits, a handful of keys) cannot set enough bits even with
+/// zero collisions, and a large one concentrates near half full.
+const MAX_TARGET_FP: f64 = 1e-3;
 
 /// The category of key a filter holds. Stored in the header so a filter in the
 /// wrong slot is rejected rather than consulted.
@@ -208,6 +231,26 @@ pub enum LoadError {
     UnsupportedVersion(u16),
     /// A header field is structurally invalid. The string names the field.
     Corrupt(&'static str),
+    /// More bits are set than a correctly sized filter could hold: `set` of
+    /// `bits`. Such a filter is forged or corrupt, and would bless almost
+    /// any key.
+    Overfull {
+        /// Bits set in the array.
+        set: u64,
+        /// Bits in the array.
+        bits: u64,
+    },
+    /// The effective false-positive rate, `(set / bits)^k`, is far above
+    /// anything a real build produces: the filter would bless a large share
+    /// of arbitrary keys.
+    ImplausibleFalsePositiveRate {
+        /// Bits set in the array.
+        set: u64,
+        /// Bits in the array.
+        bits: u64,
+        /// Hash functions per key, from the header.
+        k: u32,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -219,132 +262,37 @@ impl fmt::Display for LoadError {
                 write!(f, "format v{v}, this build reads {SUPPORTED_VERSIONS:?}")
             }
             Self::Corrupt(field) => write!(f, "corrupt header field: {field}"),
+            Self::Overfull { set, bits } => write!(
+                f,
+                "implausibly full bit array: {set} of {bits} bits set (max {MAX_FILL_PERCENT}%)"
+            ),
+            Self::ImplausibleFalsePositiveRate { set, bits, k } => write!(
+                f,
+                "implausible false-positive rate {:.4}: {set} of {bits} bits set, k={k} (max {MAX_EFFECTIVE_FP})",
+                effective_fp(*set, *bits, *k)
+            ),
         }
     }
 }
 
 impl std::error::Error for LoadError {}
 
-/// An immutable, queryable filter.
-///
-/// One buffer holds the whole file image: loading does not copy the bit array
-/// out of it and writing hands it straight back, so a 32 MiB filter costs
-/// 32 MiB once. Membership testing is deliberately not public.
-#[derive(Clone)]
-pub struct Filter {
-    /// The whole on-disk image: [`HEADER_LEN`] bytes of header, then the bits.
-    bytes: Vec<u8>,
-    kind: Kind,
-    tier: Tier,
+/// A parsed header: everything about a filter but its bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Header {
+    pub(crate) kind: Kind,
+    pub(crate) tier: Tier,
     version: u16,
     k: u32,
     m_bits: u64,
-    n: u64,
+    pub(crate) n: u64,
     seed: u64,
 }
 
-impl fmt::Debug for Filter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Filter")
-            .field("stem", &self.stem())
-            .field("version", &self.version)
-            .field("k", &self.k)
-            .field("m_bits", &self.m_bits)
-            .field("n", &self.n)
-            .finish()
-    }
-}
-
-impl Filter {
-    /// The key category this filter holds.
-    #[must_use]
-    pub const fn kind(&self) -> Kind {
-        self.kind
-    }
-
-    /// The trust tier this filter encodes.
-    #[must_use]
-    pub const fn tier(&self) -> Tier {
-        self.tier
-    }
-
-    /// The layout version this filter carries.
-    #[must_use]
-    pub const fn version(&self) -> u16 {
-        self.version
-    }
-
-    /// Keys inserted at build time.
-    #[must_use]
-    pub const fn len(&self) -> u64 {
-        self.n
-    }
-
-    /// True when no keys were inserted.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.n == 0
-    }
-
-    /// Canonical artifact stem, e.g. `purl-good`. The one place file names
-    /// are spelled.
-    #[must_use]
-    pub fn stem(&self) -> String {
-        format!("{}-{}", self.kind.as_str(), self.tier.as_str())
-    }
-
-    /// The on-disk image, ready to write. No allocation, no copy.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Re-stamp for an older bundle, or `None` when this tier did not exist at
-    /// that version.
-    ///
-    /// `None` rather than a silent downgrade: a `sighted-*` filter has no v1
-    /// meaning, and writing one into a v1 bundle hands a client a file it must
-    /// reject, failing its whole update. The caller folds or drops.
-    #[must_use]
-    pub fn stamped_as(mut self, version: u16) -> Option<Self> {
-        if version < self.tier.min_format_version() || !SUPPORTED_VERSIONS.contains(&version) {
-            return None;
-        }
-        self.version = version;
-        let slot = self.bytes.get_mut(4..6)?;
-        slot.copy_from_slice(&version.to_le_bytes());
-        Some(self)
-    }
-
-    /// Test a key for possible membership. `false` is authoritative; `true` is
-    /// probabilistic.
-    ///
-    /// Crate-private, and staying that way: anyone who can ask one filter this
-    /// can act on a `good` hit without consulting the adverse tiers.
-    pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> bool {
-        // `all` short-circuits, so a miss costs about two probes rather than k.
-        // Most queries are misses; this is the hot path.
-        self.probes(digest).all(|i| self.bit(i))
-    }
-
-    fn probes(&self, digest: &[u8; 32]) -> Probes {
-        Probes::new(self.k, self.m_bits, self.seed, digest)
-    }
-
-    #[inline]
-    fn bit(&self, idx: usize) -> bool {
-        // idx < m_bits by construction, so the byte is in range; ask anyway.
-        self.bytes
-            .get(HEADER_LEN + (idx >> 3))
-            .is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
-    }
-
-    /// Parse a filter from its on-disk image, taking ownership of the buffer.
-    ///
-    /// # Errors
-    /// [`LoadError`] if the buffer is truncated, the magic or version does not
-    /// match, or a header field is invalid.
-    pub fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
+impl Header {
+    /// Parse the header at the start of `bytes`, rejecting any field that is
+    /// structurally invalid. Says nothing about the bits that follow.
+    fn parse(bytes: &[u8]) -> Result<Self, LoadError> {
         let head = bytes.get(..HEADER_LEN).ok_or(LoadError::Truncated)?;
         let u16_at = |o: usize| -> u16 {
             head.get(o..o + 2)
@@ -395,11 +343,6 @@ impl Filter {
         if m_bits < MIN_BITS || !m_bits.is_power_of_two() {
             return Err(LoadError::Corrupt("m_bits not a power of two >= 64"));
         }
-        // The image is the header plus exactly m/8 bytes, no more.
-        if (bytes.len() as u64).checked_sub(HEADER_LEN as u64) != Some(m_bits / 8) {
-            return Err(LoadError::Truncated);
-        }
-
         Ok(Self {
             kind,
             tier,
@@ -408,8 +351,221 @@ impl Filter {
             m_bits,
             n: u64_at(20),
             seed: u64_at(28),
-            bytes,
         })
+    }
+
+    /// Bytes in the whole image: the header, then exactly m/8 bytes of bits.
+    const fn image_len(&self) -> u64 {
+        HEADER_LEN as u64 + self.m_bits / 8
+    }
+
+    /// Canonical artifact stem, e.g. `purl-good`. The one place file names
+    /// are spelled.
+    pub(crate) fn stem(&self) -> String {
+        format!("{}-{}", self.kind.as_str(), self.tier.as_str())
+    }
+
+    fn probes(&self, digest: &[u8; 32]) -> Probes {
+        Probes::new(self.k, self.m_bits, self.seed, digest)
+    }
+}
+
+/// An immutable, queryable filter.
+///
+/// One buffer holds the whole file image: loading does not copy the bit array
+/// out of it and writing hands it straight back, so a 32 MiB filter costs
+/// 32 MiB once. Membership testing is deliberately not public.
+#[derive(Clone)]
+pub struct Filter {
+    /// The whole on-disk image: [`HEADER_LEN`] bytes of header, then the bits.
+    bytes: Vec<u8>,
+    header: Header,
+}
+
+impl fmt::Debug for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Filter")
+            .field("stem", &self.stem())
+            .field("version", &self.header.version)
+            .field("k", &self.header.k)
+            .field("m_bits", &self.header.m_bits)
+            .field("n", &self.header.n)
+            .finish()
+    }
+}
+
+impl Filter {
+    /// The key category this filter holds.
+    #[must_use]
+    pub const fn kind(&self) -> Kind {
+        self.header.kind
+    }
+
+    /// The trust tier this filter encodes.
+    #[must_use]
+    pub const fn tier(&self) -> Tier {
+        self.header.tier
+    }
+
+    /// The layout version this filter carries.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.header.version
+    }
+
+    /// Keys inserted at build time.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.header.n
+    }
+
+    /// True when no keys were inserted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.header.n == 0
+    }
+
+    /// Canonical artifact stem, e.g. `purl-good`. The one place file names
+    /// are spelled.
+    #[must_use]
+    pub fn stem(&self) -> String {
+        self.header.stem()
+    }
+
+    /// The on-disk image, ready to write. No allocation, no copy.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Re-stamp for an older bundle, or `None` when this tier did not exist at
+    /// that version.
+    ///
+    /// `None` rather than a silent downgrade: a `sighted-*` filter has no v1
+    /// meaning, and writing one into a v1 bundle hands a client a file it must
+    /// reject, failing its whole update. The caller folds or drops.
+    #[must_use]
+    pub fn stamped_as(mut self, version: u16) -> Option<Self> {
+        if version < self.header.tier.min_format_version() || !SUPPORTED_VERSIONS.contains(&version)
+        {
+            return None;
+        }
+        self.header.version = version;
+        let slot = self.bytes.get_mut(4..6)?;
+        slot.copy_from_slice(&version.to_le_bytes());
+        Some(self)
+    }
+
+    /// Test a key for possible membership. `false` is authoritative; `true` is
+    /// probabilistic.
+    ///
+    /// Crate-private, and staying that way: anyone who can ask one filter this
+    /// can act on a `good` hit without consulting the adverse tiers.
+    pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> bool {
+        // `all` short-circuits, so a miss costs about two probes rather than k.
+        // Most queries are misses; this is the hot path.
+        self.header.probes(digest).all(|i| self.bit(i))
+    }
+
+    #[inline]
+    fn bit(&self, idx: usize) -> bool {
+        // idx < m_bits by construction, so the byte is in range; ask anyway.
+        self.bytes
+            .get(HEADER_LEN + (idx >> 3))
+            .is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
+    }
+
+    /// Parse a filter from its on-disk image, taking ownership of the buffer.
+    ///
+    /// # Errors
+    /// [`LoadError`] if the buffer is truncated, the magic or version does not
+    /// match, a header field is invalid, or the bit array is implausibly full.
+    pub fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
+        let header = Header::parse(&bytes)?;
+        let Header { k, m_bits, .. } = header;
+        // The image is the header plus exactly m/8 bytes, no more.
+        if bytes.len() as u64 != header.image_len() {
+            return Err(LoadError::Truncated);
+        }
+        // The array is m/8 bytes, a whole number of words, so count by word.
+        let set: u64 = bytes
+            .get(HEADER_LEN..)
+            .unwrap_or_default()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| u64::from(u64::from_ne_bytes(*w).count_ones()))
+            .sum();
+        if u128::from(set) * 100 > u128::from(m_bits) * u128::from(MAX_FILL_PERCENT) {
+            return Err(LoadError::Overfull { set, bits: m_bits });
+        }
+        if effective_fp(set, m_bits, k) > MAX_EFFECTIVE_FP {
+            return Err(LoadError::ImplausibleFalsePositiveRate {
+                set,
+                bits: m_bits,
+                k,
+            });
+        }
+
+        Ok(Self { bytes, header })
+    }
+}
+
+/// A filter file read as probes need it, never loaded whole.
+///
+/// Opening checks the header and that the file is exactly as long as the
+/// header declares; the bits are not read, so their fill is not checked here.
+/// That is [`Filter::load`]'s job, for whoever installs a bundle.
+#[derive(Debug)]
+pub(crate) struct OnDisk {
+    file: File,
+    header: Header,
+}
+
+/// Why a filter file could not be opened for probing.
+#[derive(Debug)]
+pub(crate) enum OnDiskError {
+    /// The file could not be read.
+    Io(io::Error),
+    /// The file is not a valid filter.
+    Invalid(LoadError),
+}
+
+impl OnDisk {
+    pub(crate) fn open(path: &Path) -> Result<Self, OnDiskError> {
+        let mut file = File::open(path).map_err(OnDiskError::Io)?;
+        let mut head = [0u8; HEADER_LEN];
+        match file.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(OnDiskError::Invalid(LoadError::Truncated));
+            }
+            Err(e) => return Err(OnDiskError::Io(e)),
+        }
+        let header = Header::parse(&head).map_err(OnDiskError::Invalid)?;
+        if file.metadata().map_err(OnDiskError::Io)?.len() != header.image_len() {
+            return Err(OnDiskError::Invalid(LoadError::Truncated));
+        }
+        Ok(Self { file, header })
+    }
+
+    pub(crate) const fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// [`Filter::may_contain`], reading one byte per probe.
+    pub(crate) fn may_contain(&mut self, digest: &[u8; 32]) -> io::Result<bool> {
+        for idx in self.header.probes(digest) {
+            let mut byte = [0u8];
+            self.file
+                .seek(SeekFrom::Start(HEADER_LEN as u64 + (idx >> 3) as u64))?;
+            self.file.read_exact(&mut byte)?;
+            let [byte] = byte;
+            if byte & (1u8 << (idx & 7)) == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -428,8 +584,9 @@ pub(crate) struct Builder {
 impl Builder {
     /// Size a builder for `expected` keys at `target_fp` false-positive rate.
     ///
-    /// `target_fp` outside `(0, 1)` falls back to `1e-9`; `expected` is floored
-    /// at 1 so the filter is never zero-bit.
+    /// `target_fp` outside `(0, MAX_TARGET_FP]` falls back to `1e-9`, since a
+    /// looser filter would be refused at load; `expected` is floored at 1 so
+    /// the filter is never zero-bit.
     ///
     /// `m = -n·ln(p) / (ln 2)²`, rounded up to a power of two so indexing is a
     /// mask. `k` is `log2(1/p)`, the probe count that reaches `p` at the ideal
@@ -449,7 +606,8 @@ impl Builder {
     pub(crate) fn new(kind: Kind, tier: Tier, expected: u64, target_fp: f64) -> Self {
         const LN2: f64 = std::f64::consts::LN_2;
         let n = expected.max(1);
-        let p = if target_fp.is_finite() && target_fp > 0.0 && target_fp < 1.0 {
+        // NaN fails both comparisons, so it falls back too.
+        let p = if target_fp > 0.0 && target_fp <= MAX_TARGET_FP {
             target_fp
         } else {
             1e-9
@@ -504,13 +662,15 @@ impl Builder {
         }
         Filter {
             bytes: self.bytes,
-            kind: self.kind,
-            tier: self.tier,
-            version: FORMAT_VERSION,
-            k: self.k,
-            m_bits: self.m_bits,
-            n: self.n,
-            seed: 0,
+            header: Header {
+                kind: self.kind,
+                tier: self.tier,
+                version: FORMAT_VERSION,
+                k: self.k,
+                m_bits: self.m_bits,
+                n: self.n,
+                seed: 0,
+            },
         }
     }
 }
@@ -560,6 +720,14 @@ fn lane(d: &[u8; 32], i: usize) -> u64 {
         .map_or(0, u64::from_le_bytes)
 }
 
+/// The chance an arbitrary key passes all `k` probes of an array with `set` of
+/// `bits` bits set: `(set / bits)^k`.
+#[allow(clippy::cast_precision_loss)]
+// Bit counts are far below 2^53, where u64 to f64 is exact; k <= MAX_K.
+fn effective_fp(set: u64, bits: u64, k: u32) -> f64 {
+    (set as f64 / bits as f64).powi(i32::try_from(k).unwrap_or(i32::MAX))
+}
+
 /// SHA-256 of a variable-length key.
 pub(crate) fn digest_of(key: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -607,14 +775,31 @@ mod tests {
         // 1e-9 needs 30 probes. The textbook k for the rounded-up m would be
         // far larger and buy accuracy nobody asked for.
         let f = build(&["a"], 1e-9);
-        assert_eq!(f.k, 30);
+        assert_eq!(f.header.k, 30);
     }
 
     #[test]
     fn a_nonsense_target_falls_back_to_a_safe_default() {
         for fp in [0.0, 1.0, -1.0, f64::NAN, f64::INFINITY] {
             let f = build(&["a"], fp);
-            assert_eq!(f.k, 30, "fp={fp} should fall back to 1e-9");
+            assert_eq!(f.header.k, 30, "fp={fp} should fall back to 1e-9");
+        }
+    }
+
+    /// A target too loose for `load` to accept is a nonsense target too.
+    #[test]
+    fn a_target_past_the_cap_falls_back() {
+        assert_eq!(
+            build(&["a"], MAX_TARGET_FP).header.k,
+            10,
+            "the cap is honoured"
+        );
+        for fp in [MAX_TARGET_FP * 1.01, 1e-2, 0.5] {
+            assert_eq!(
+                build(&["a"], fp).header.k,
+                30,
+                "fp={fp} should fall back to 1e-9"
+            );
         }
     }
 
@@ -633,6 +818,12 @@ mod tests {
             LoadError::BadMagic,
             LoadError::UnsupportedVersion(7),
             LoadError::Corrupt("kind"),
+            LoadError::Overfull { set: 64, bits: 64 },
+            LoadError::ImplausibleFalsePositiveRate {
+                set: 47,
+                bits: 64,
+                k: 1,
+            },
         ] {
             assert!(!e.to_string().is_empty(), "{e:?}");
         }
@@ -829,6 +1020,98 @@ mod tests {
             slot.copy_from_slice(&(1u64 << 62).to_le_bytes());
         }
         assert_eq!(Filter::load(bytes).err(), Some(LoadError::Truncated));
+    }
+
+    /// A forged array with every bit set would bless every key.
+    #[test]
+    fn an_all_ones_filter_is_rejected() {
+        let mut bytes = build(&["x"], 1e-9).as_bytes().to_vec();
+        let bits = (bytes.len() - HEADER_LEN) as u64 * 8;
+        bytes[HEADER_LEN..].fill(0xff);
+        assert_eq!(
+            Filter::load(bytes).err(),
+            Some(LoadError::Overfull { set: bits, bits })
+        );
+    }
+
+    #[test]
+    fn the_fill_ceiling_is_exact() {
+        let mut bytes = Builder::new(Kind::Sha256, Tier::Good, 0, 1e-9)
+            .build()
+            .as_bytes()
+            .to_vec();
+        let array = &mut bytes[HEADER_LEN..];
+        let at_limit = array.len() * 3 / 4; // 75% of the bytes, all ones
+        array[..at_limit].fill(0xff);
+        assert!(Filter::load(bytes.clone()).is_ok(), "75% full must load");
+
+        bytes[HEADER_LEN + at_limit] = 1;
+        assert!(matches!(
+            Filter::load(bytes).err(),
+            Some(LoadError::Overfull { .. })
+        ));
+    }
+
+    /// The header's `k` is forgeable too: an array under the fill ceiling
+    /// still blesses most keys when it claims a single probe.
+    #[test]
+    fn a_forged_k_of_one_is_rejected() {
+        let mut bytes = Builder::new(Kind::Sha256, Tier::Good, 100, 1e-9)
+            .build()
+            .as_bytes()
+            .to_vec();
+        let array = &mut bytes[HEADER_LEN..];
+        let filled = array.len() * 74 / 100; // about 74% of bits set
+        array[..filled].fill(0xff);
+        assert!(
+            Filter::load(bytes.clone()).is_ok(),
+            "at the real k this fill is harmless"
+        );
+
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            Filter::load(bytes).err(),
+            Some(LoadError::ImplausibleFalsePositiveRate { k: 1, .. })
+        ));
+    }
+
+    /// Small filters at the loosest accepted target, where the spread of the
+    /// fill is widest, must still load.
+    #[test]
+    fn small_filters_at_the_loosest_target_load() {
+        for n in 1..=300u64 {
+            let mut b = Builder::new(Kind::Sha256, Tier::Good, n, MAX_TARGET_FP);
+            for i in 0..n {
+                b.insert_digest(&digest_of(format!("small-{n}-{i}").as_bytes()));
+            }
+            let loaded = Filter::load(b.build().as_bytes().to_vec());
+            assert!(loaded.is_ok(), "n={n}: {loaded:?}");
+        }
+    }
+
+    /// Real filters, at realistic sizes and every target in use, stay well
+    /// clear of the ceiling. 1e-2 is past [`MAX_TARGET_FP`] and builds at the
+    /// fallback.
+    #[test]
+    fn real_filters_load() {
+        for (n, p) in [
+            (1u64, 1e-9),
+            (4, 1e-3),
+            (5_000, 1e-9),
+            (20_000, 1e-3),
+            (1_000, 1e-2),
+        ] {
+            let mut b = Builder::new(Kind::Sha256, Tier::Good, n, p);
+            for i in 0..n {
+                b.insert_digest(&digest_of(format!("real-{n}-{i}").as_bytes()));
+            }
+            let loaded = Filter::load(b.build().as_bytes().to_vec());
+            assert_eq!(
+                loaded.as_ref().map(Filter::len).ok(),
+                Some(n),
+                "n={n} p={p}: {loaded:?}"
+            );
+        }
     }
 
     #[test]

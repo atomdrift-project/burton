@@ -35,6 +35,8 @@
 //!
 //! - [`Lookup::open`] treats the manifest as authority and fails whole. A bundle
 //!   that will not open completely grants nothing.
+//! - Filters stay on disk and are read as decisions probe them. A filter that
+//!   cannot be read when consulted, such as mid-update, grants nothing either.
 //! - A bless is withheld unless the matching `bad` filter is loaded. That filter
 //!   is the revocation channel.
 //! - Single-filter membership is not public. Asking "is this blessed?" without

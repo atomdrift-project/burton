@@ -443,3 +443,54 @@ fn every_open_error_renders() {
             .is_empty()
     );
 }
+
+/// An open bundle holds no file, so an updater can swap the directory out from
+/// under it on every platform. Once it is gone, nothing is blessed or convicted.
+#[test]
+fn a_bundle_moved_away_while_open_decides_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("bundle");
+    std::fs::create_dir(&dir).unwrap();
+    publish(&dir);
+    let lk = open(&dir);
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+
+    std::fs::rename(&dir, root.path().join("old")).unwrap();
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::Unknown);
+}
+
+/// A bundle replaced while open is read as the replacement: a revocation it
+/// carries takes effect without reopening.
+#[test]
+fn a_revocation_installed_while_open_is_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+
+    let mut sets = KeySets::new();
+    sets.insert(
+        Tier::Bad,
+        Record {
+            purl: None,
+            sha256: Some(digest(1)),
+        },
+    );
+    build::write_bundle(dir.path(), &sets.into_filters(1e-9), "2026-09-01", SCHEME).unwrap();
+    assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
+    assert!(lk.decide(&Artifact::sha256(&digest(1))).is_adverse());
+}
+
+/// A file that changes tier after open is no longer the filter its slot names,
+/// so it decides nothing rather than blessing from the wrong pool.
+#[test]
+fn a_filter_relabelled_while_open_decides_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+
+    let bad = std::fs::read(dir.path().join("sha256-bad.adbl")).unwrap();
+    std::fs::write(dir.path().join("sha256-good.adbl"), bad).unwrap();
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
+}
