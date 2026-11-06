@@ -14,7 +14,7 @@ mod support {
 
 use std::path::Path;
 
-use burton::{Artifact, Decision, Filter, KeySets, Lookup, Record, Tier, write_bundle};
+use burton::{Artifact, Decision, Filter, KeySets, Kind, Lookup, Record, Tier, write_bundle};
 use support::alloc::{Counting, measure};
 
 #[global_allocator]
@@ -150,7 +150,8 @@ fn key_sets_hold_digests_not_keys() {
         }
         sets
     });
-    assert_eq!(sets.counts(Tier::Good), (N as usize, 0));
+    assert_eq!(sets.count(Kind::Purl, Tier::Good), N as usize);
+    assert_eq!(sets.count(Kind::Sha256, Tier::Good), 0);
     // A 32-byte digest and a control byte per bucket, peaking while the table
     // doubles: about 65 bytes a key at this size. Keeping the purls as well
     // would add about 80 more here, and grow with their length.

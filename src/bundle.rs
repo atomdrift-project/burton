@@ -6,28 +6,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::filter::{Builder, Filter, Kind, Tier, digest_of, stem};
-use crate::lookup::OpenError;
-
-/// The file naming a bundle's contents. Read by [`crate::Lookup::open`].
-pub const MANIFEST_FILE: &str = "bloom.toml";
-
-/// The one manifest layout version this build reads and writes.
-///
-/// Bump it on any change to what a manifest says: an older build then
-/// refuses the new bundle instead of misreading it. Never reuse a number;
-/// 1 was an unpublished draft.
-pub const MANIFEST_SCHEMA: u32 = 2;
-
-/// Largest manifest this build will read. A real one is about a kilobyte;
-/// the cap keeps a hostile one from costing unbounded memory.
-pub(crate) const MAX_MANIFEST_LEN: u64 = 64 * 1024;
+use crate::manifest::{Entry, MANIFEST_FILE, MANIFEST_SCHEMA, Manifest};
 
 /// One artifact from the pool. Either field may be absent; a record with
 /// neither contributes nothing.
@@ -91,13 +75,11 @@ impl KeySets {
         }
     }
 
-    /// Deduplicated `(purl, sha256)` key counts for one tier, before subtraction.
+    /// Distinct keys of `kind` held for `tier`, before claims are subtracted
+    /// from `good`.
     #[must_use]
-    pub fn counts(&self, tier: Tier) -> (usize, usize) {
-        (
-            self.sets[Kind::Purl.index()][tier.index()].len(),
-            self.sets[Kind::Sha256.index()][tier.index()].len(),
-        )
+    pub fn count(&self, kind: Kind, tier: Tier) -> usize {
+        self.sets[kind.index()][tier.index()].len()
     }
 
     /// Build one filter per (kind, tier): the complete set [`write_bundle`]
@@ -140,40 +122,6 @@ impl KeySets {
     }
 }
 
-/// One filter's entry in the manifest.
-///
-/// Unknown fields are refused, as unknown header fields are: a manifest this
-/// build does not fully understand is not one it may act on.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Entry {
-    /// File name within the bundle directory, e.g. `purl-good.adbl`. A bare
-    /// name: [`crate::Lookup::open`] refuses anything with a path in it.
-    pub file: String,
-    /// Lowercase hex SHA-256 of the file, for an installer to verify a
-    /// download against.
-    pub sha256: String,
-    /// Keys inserted. Informational.
-    pub n: u64,
-}
-
-/// The contract between producing a bundle and opening one.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Manifest {
-    /// Manifest layout version ([`MANIFEST_SCHEMA`]).
-    pub schema: u32,
-    /// Build date, `YYYY-MM-DD`.
-    pub built: String,
-    /// The key canonicalization that produced this bundle's keys.
-    /// [`crate::Lookup::open`] refuses a bundle whose scheme is not the
-    /// caller's.
-    pub key_scheme: String,
-    /// One entry per filter, keyed by stem (`purl-good`, …). A bundle has
-    /// exactly one filter for every (kind, tier).
-    pub filter: BTreeMap<String, Entry>,
-}
-
 /// Write every filter to `<dir>/<stem>.adbl`, then the manifest naming them.
 ///
 /// `filters` must hold exactly one filter for every (kind, tier), as
@@ -195,11 +143,12 @@ pub struct Manifest {
 /// filter; otherwise any file that cannot be written, or a manifest that
 /// cannot be serialized.
 pub fn write_bundle(
-    dir: &Path,
+    dir: impl AsRef<Path>,
     filters: &[Filter],
     built: &str,
     key_scheme: &str,
 ) -> Result<Manifest, WriteError> {
+    let dir = dir.as_ref();
     let mut counts = [[0usize; Tier::ALL.len()]; Kind::ALL.len()];
     for f in filters {
         counts[f.kind().index()][f.tier().index()] += 1;
@@ -291,75 +240,6 @@ fn sync_dir(dir: &Path) -> Result<(), WriteError> {
             })?;
     }
     Ok(())
-}
-
-/// Read the manifest in `dir`, typically a previous build to size a new one
-/// against.
-///
-/// `Ok(None)` only when there is no manifest. One that exists but cannot be
-/// read or parsed is an error: treating it as "no baseline" would silently
-/// switch off [`verify`]'s collapse and ratio checks.
-///
-/// # Errors
-/// [`OpenError::Io`], [`OpenError::TooLarge`], [`OpenError::Parse`], or
-/// [`OpenError::Schema`].
-pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
-    match load_manifest(dir) {
-        Err(OpenError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        other => other.map(|(manifest, _)| Some(manifest)),
-    }
-}
-
-/// Read, parse, and schema-check the manifest in `dir`, with the metadata of
-/// the very file read.
-pub(crate) fn load_manifest(dir: &Path) -> Result<(Manifest, Metadata), OpenError> {
-    let path = dir.join(MANIFEST_FILE);
-    let read = File::open(&path).and_then(|f| {
-        let meta = f.metadata()?;
-        let capacity = usize::try_from(meta.len().min(MAX_MANIFEST_LEN)).unwrap_or(0);
-        let mut text = String::with_capacity(capacity);
-        // One byte past the cap tells a manifest at the limit from one over
-        // it, even when the file grows after the metadata was read.
-        f.take(MAX_MANIFEST_LEN + 1).read_to_string(&mut text)?;
-        Ok((text, meta))
-    });
-    let (text, meta) = match read {
-        Ok(read) => read,
-        Err(source) => return Err(OpenError::Io { path, source }),
-    };
-    if text.len() as u64 > MAX_MANIFEST_LEN {
-        return Err(OpenError::TooLarge { path });
-    }
-    let manifest: Manifest = match toml::from_str(&text) {
-        Ok(m) => m,
-        Err(source) => {
-            // A manifest of another schema need not parse as this one. Say
-            // which schema it is, rather than which field this one lacks.
-            #[derive(Deserialize)]
-            struct Versioned {
-                schema: u32,
-            }
-            if let Ok(Versioned { schema }) = toml::from_str(&text)
-                && schema != MANIFEST_SCHEMA
-            {
-                return Err(OpenError::Schema {
-                    path,
-                    found: schema,
-                });
-            }
-            return Err(OpenError::Parse {
-                path,
-                source: Box::new(source),
-            });
-        }
-    };
-    if manifest.schema != MANIFEST_SCHEMA {
-        return Err(OpenError::Schema {
-            path,
-            found: manifest.schema,
-        });
-    }
-    Ok((manifest, meta))
 }
 
 /// Why a bundle could not be written.
@@ -479,14 +359,39 @@ pub enum VerifyError {
         was: u64,
     },
     /// A filter's key count moved further than the bounds allow.
-    Ratio {
-        /// The filter's stem.
-        stem: String,
-        /// How many keys it held last build.
-        was: u64,
-        /// How many it holds now.
-        now: u64,
-    },
+    Ratio(RatioBreach),
+}
+
+/// A filter whose key count moved further than the ratio bounds allow: fatal
+/// under [`Ratio::Enforce`], returned by [`verify`] under [`Ratio::Waive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatioBreach {
+    /// The filter's stem.
+    pub stem: String,
+    /// How many keys it held last build.
+    pub was: u64,
+    /// How many it holds now.
+    pub now: u64,
+}
+
+impl fmt::Display for RatioBreach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { stem, was, now } = self;
+        if now < was {
+            write!(
+                f,
+                "{stem} shrank to {now} keys from {was} ({:.0}% of previous, floor {:.0}%)",
+                ratio(*now, *was) * 100.0,
+                MAX_SHRINK * 100.0
+            )
+        } else {
+            write!(
+                f,
+                "{stem} grew to {now} keys from {was} ({:.1}x previous, ceiling {MAX_GROWTH:.1}x)",
+                ratio(*now, *was)
+            )
+        }
+    }
 }
 
 impl fmt::Display for VerifyError {
@@ -499,17 +404,7 @@ impl fmt::Display for VerifyError {
             Self::Collapsed { stem, was } => {
                 write!(f, "{stem} collapsed to 0 keys (was {was})")
             }
-            Self::Ratio { stem, was, now } if now < was => write!(
-                f,
-                "{stem} shrank to {now} keys from {was} ({:.0}% of previous, floor {:.0}%)",
-                ratio(*now, *was) * 100.0,
-                MAX_SHRINK * 100.0
-            ),
-            Self::Ratio { stem, was, now } => write!(
-                f,
-                "{stem} grew to {now} keys from {was} ({:.1}x previous, ceiling {MAX_GROWTH:.1}x)",
-                ratio(*now, *was)
-            ),
+            Self::Ratio(breach) => breach.fmt(f),
         }
     }
 }
@@ -526,8 +421,8 @@ impl std::error::Error for VerifyError {}
 ///    past the ratio bounds.
 ///
 /// [`Ratio::Waive`] downgrades **only** the ratio bounds. Canaries, vouched
-/// digests, and the collapse guard stay fatal. Waived breaches are returned,
-/// not swallowed.
+/// digests, and the collapse guard stay fatal. The breaches it waives are
+/// returned, not swallowed; under [`Ratio::Enforce`] there are none.
 ///
 /// # Errors
 /// The first violation found.
@@ -536,7 +431,7 @@ pub fn verify(
     prev: Option<&Manifest>,
     vouched: &[(String, [u8; 32])],
     policy: Ratio,
-) -> Result<Vec<VerifyError>, VerifyError> {
+) -> Result<Vec<RatioBreach>, VerifyError> {
     let digests = |tier: Tier| {
         filters
             .iter()
@@ -596,14 +491,14 @@ pub fn verify(
         if (MAX_SHRINK..=MAX_GROWTH).contains(&ratio(now, was)) {
             continue;
         }
-        let breach = VerifyError::Ratio {
+        let breach = RatioBreach {
             stem: stem.to_owned(),
             was,
             now,
         };
         match policy {
             Ratio::Waive => waived.push(breach),
-            Ratio::Enforce => return Err(breach),
+            Ratio::Enforce => return Err(VerifyError::Ratio(breach)),
         }
     }
     Ok(waived)
@@ -698,7 +593,7 @@ mod tests {
         assert_eq!(m.schema, MANIFEST_SCHEMA);
         assert_eq!(m.key_scheme, "test/v1");
         assert_eq!(m.filter.len(), filters.len());
-        assert_eq!(read_manifest(dir.path()).unwrap().as_ref(), Some(&m));
+        assert_eq!(crate::read_manifest(dir.path()).unwrap().as_ref(), Some(&m));
 
         let lk = crate::Lookup::open(dir.path(), "test/v1").unwrap();
         assert!(lk.may_skip(&crate::Artifact::sha256(&digest(4))));
@@ -819,68 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn read_manifest_tells_absent_from_broken() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_manifest(dir.path()).unwrap(), None);
-
-        std::fs::write(dir.path().join(MANIFEST_FILE), "garbage {{").unwrap();
-        assert!(matches!(
-            read_manifest(dir.path()),
-            Err(OpenError::Parse { .. })
-        ));
-
-        let mut m = baseline(&[("sha256-good", 1)]);
-        m.schema = MANIFEST_SCHEMA + 1;
-        std::fs::write(dir.path().join(MANIFEST_FILE), toml::to_string(&m).unwrap()).unwrap();
-        assert!(matches!(
-            read_manifest(dir.path()),
-            Err(OpenError::Schema { found, .. }) if found == MANIFEST_SCHEMA + 1
-        ));
-    }
-
-    /// A manifest from another schema is reported as one, however different
-    /// its shape — not as this schema's missing or unknown fields.
-    #[test]
-    fn another_schema_is_named_whatever_its_shape() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(MANIFEST_FILE);
-        for text in [
-            "schema = 1",
-            "schema = 3\nfilters = []",
-            "schema = 1\nbuilt = 7",
-        ] {
-            std::fs::write(&path, text).unwrap();
-            assert!(
-                matches!(read_manifest(dir.path()), Err(OpenError::Schema { .. })),
-                "{text}"
-            );
-        }
-        // Our own schema, malformed, is a parse error that says what is wrong.
-        std::fs::write(&path, "schema = 2").unwrap();
-        let err = read_manifest(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("built"), "{err}");
-    }
-
-    #[test]
-    fn an_oversized_manifest_is_refused_unread() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(MANIFEST_FILE);
-        let limit = usize::try_from(MAX_MANIFEST_LEN).unwrap();
-
-        // At the limit it is read (and fails only as TOML); one byte more is not.
-        std::fs::write(&path, "#".repeat(limit)).unwrap();
-        assert!(matches!(
-            read_manifest(dir.path()),
-            Err(OpenError::Parse { .. })
-        ));
-        std::fs::write(&path, "#".repeat(limit + 1)).unwrap();
-        assert!(matches!(
-            read_manifest(dir.path()),
-            Err(OpenError::TooLarge { .. })
-        ));
-    }
-
-    #[test]
     fn the_canary_is_eicar() {
         let eicar = CANARIES.first().unwrap();
         assert_eq!(
@@ -950,7 +783,8 @@ mod tests {
                 },
             );
         }
-        assert_eq!(sets.counts(Tier::Good), (1, 1));
+        assert_eq!(sets.count(Kind::Purl, Tier::Good), 1);
+        assert_eq!(sets.count(Kind::Sha256, Tier::Good), 1);
         let filters = sets.into_filters(1e-9);
         assert_eq!(find(&filters, "sha256-good").len(), 1);
         assert_eq!(find(&filters, "purl-good").len(), 1);
@@ -962,41 +796,8 @@ mod tests {
         sets.insert(Tier::Good, Record::purl("pkg:npm/x@1"));
         sets.insert(Tier::Good, rec(digest(2)));
         sets.insert(Tier::Good, Record::default());
-        assert_eq!(sets.counts(Tier::Good), (1, 1));
-    }
-
-    #[test]
-    fn the_manifest_round_trips() {
-        let m = baseline(&[("sha256-good", 42)]);
-        let back: Manifest = toml::from_str(&toml::to_string(&m).unwrap()).unwrap();
-        assert_eq!(back, m);
-    }
-
-    /// A manifest that does not name its key scheme could be opened under
-    /// any scheme at all, so it does not parse.
-    #[test]
-    fn a_manifest_without_a_key_scheme_is_refused() {
-        let text = r#"
-schema = 2
-built = "2026-01-01"
-[filter.sha256-good]
-file = "sha256-good.adbl"
-sha256 = "00"
-n = 7
-"#;
-        let err = toml::from_str::<Manifest>(text).unwrap_err();
-        assert!(err.to_string().contains("key_scheme"), "{err}");
-    }
-
-    /// A field this build does not know may change what the manifest means,
-    /// at the top level or in an entry.
-    #[test]
-    fn a_manifest_with_unknown_fields_is_refused() {
-        let text = toml::to_string(&baseline(&[("sha256-good", 1)])).unwrap();
-        let top = text.replacen("schema", "mystery = 1\nschema", 1);
-        assert!(toml::from_str::<Manifest>(&top).is_err(), "{top}");
-        let entry = text.replacen("n = 1", "n = 1\nformat_version = 2", 1);
-        assert!(toml::from_str::<Manifest>(&entry).is_err(), "{entry}");
+        assert_eq!(sets.count(Kind::Purl, Tier::Good), 1);
+        assert_eq!(sets.count(Kind::Sha256, Tier::Good), 1);
     }
 
     #[test]
@@ -1034,11 +835,11 @@ n = 7
         let prev = baseline(&[("sha256-bad", 2_000)]);
         let grown = sets(&many).into_filters(1e-9); // 8000/2000 = 4x
         let err = verify(&grown, Some(&prev), &[], Ratio::Enforce).unwrap_err();
-        let VerifyError::Ratio {
+        let VerifyError::Ratio(RatioBreach {
             was: 2_000,
             now: 8_000,
             ..
-        } = &err
+        }) = &err
         else {
             panic!("expected a ratio breach, got {err:?}");
         };
@@ -1108,13 +909,20 @@ n = 7
         let filters = sets(&rows).into_filters(1e-9);
         let prev = baseline(&[("sha256-good", 100_000)]);
 
-        assert!(matches!(
+        // 2,000 rows, 256 distinct digests.
+        let breach = RatioBreach {
+            stem: "sha256-good".to_owned(),
+            was: 100_000,
+            now: 256,
+        };
+        assert_eq!(
             verify(&filters, Some(&prev), &[], Ratio::Enforce),
-            Err(VerifyError::Ratio { .. })
-        ));
-        let waived = verify(&filters, Some(&prev), &[], Ratio::Waive).unwrap();
-        assert_eq!(waived.len(), 1);
-        assert!(matches!(waived.first(), Some(VerifyError::Ratio { .. })));
+            Err(VerifyError::Ratio(breach.clone()))
+        );
+        assert_eq!(
+            verify(&filters, Some(&prev), &[], Ratio::Waive),
+            Ok(vec![breach])
+        );
     }
 
     #[test]

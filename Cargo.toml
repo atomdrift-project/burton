@@ -40,7 +40,3 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-
-[profile.dev]
-# `false` still permits local Thin LTO in optimized crates.
-lto = "off"

@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, MAX_MANIFEST_LEN, load_manifest};
 use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of, stem};
+use crate::manifest::{MANIFEST_FILE, ManifestError, load_manifest};
 
 /// What to do with an artifact before spending real work on it.
 ///
@@ -287,6 +287,8 @@ struct Slot(OnDisk);
 
 #[cfg(unix)]
 impl Slot {
+    /// The path is not kept: the held handle follows its file wherever it is
+    /// renamed, so decisions read the build that was opened.
     fn new(_path: PathBuf, filter: OnDisk) -> Self {
         Self(filter)
     }
@@ -315,11 +317,12 @@ struct Slot {
 
 #[cfg(not(unix))]
 impl Slot {
+    /// Only the header is kept. The file is closed: here a held handle would
+    /// stop an updater renaming the bundle's directory.
     fn new(path: PathBuf, filter: OnDisk) -> Self {
-        Self {
-            path,
-            header: *filter.header(),
-        }
+        let header = *filter.header();
+        drop(filter);
+        Self { path, header }
     }
 
     fn header(&self) -> &Header {
@@ -479,7 +482,7 @@ impl Lookup {
 
     /// Open the bundle in `dir`, requiring the key scheme `scheme`.
     ///
-    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`] and
+    /// The manifest is the authority. It must be at [`crate::MANIFEST_SCHEMA`] and
     /// name exactly one filter for every (kind, tier), and each filter must be
     /// a bare file name in `dir`, have a valid header, and identify itself as
     /// the filter it is named as. **Any failure fails the whole open**: a
@@ -540,7 +543,7 @@ impl Lookup {
     ///
     /// # Errors
     /// What [`Lookup::open`] would return for the bundle in place, including
-    /// [`OpenError::Io`] when its manifest is gone.
+    /// [`OpenError::Manifest`] when its manifest is gone.
     pub fn refresh(&self) -> Result<(), OpenError> {
         self.bundle.as_ref().map_or(Ok(()), Bundle::refresh)
     }
@@ -608,7 +611,7 @@ impl Bundle {
     /// [`Lookup::refresh`]: [`Self::current`], without the deferral, and
     /// with the reason.
     fn refresh(&self) -> Result<(), OpenError> {
-        let manifest = FileId::now(&self.manifest).map_err(|source| OpenError::Io {
+        let manifest = FileId::now(&self.manifest).map_err(|source| ManifestError::Io {
             path: self.manifest.clone(),
             source,
         })?;
@@ -661,31 +664,14 @@ impl Default for Lookup {
 /// no usable bundle, so nothing may be skipped.
 #[derive(Debug)]
 pub enum OpenError {
-    /// A file could not be read: the manifest, or a filter it names.
+    /// The manifest is missing, unreadable, or not one this build reads.
+    Manifest(ManifestError),
+    /// A filter the manifest names could not be read.
     Io {
-        /// The file being read.
+        /// The filter's path.
         path: PathBuf,
         /// What went wrong.
         source: io::Error,
-    },
-    /// The manifest is larger than any real one, and was not read.
-    TooLarge {
-        /// The manifest's path.
-        path: PathBuf,
-    },
-    /// The manifest is not valid TOML, or not shaped like a manifest.
-    Parse {
-        /// The manifest's path.
-        path: PathBuf,
-        /// What went wrong.
-        source: Box<toml::de::Error>,
-    },
-    /// The manifest's layout version is not [`MANIFEST_SCHEMA`].
-    Schema {
-        /// The manifest's path.
-        path: PathBuf,
-        /// The version it declares.
-        found: u32,
     },
     /// The bundle's key scheme is not the caller's. Not corruption: producer
     /// and consumer would simply agree on nothing.
@@ -731,18 +717,8 @@ pub enum OpenError {
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Manifest(err) => err.fmt(f),
             Self::Io { path, source } => write!(f, "reading {}: {source}", path.display()),
-            Self::TooLarge { path } => write!(
-                f,
-                "{}: manifest is larger than {MAX_MANIFEST_LEN} bytes",
-                path.display()
-            ),
-            Self::Parse { path, source } => write!(f, "parsing {}: {source}", path.display()),
-            Self::Schema { path, found } => write!(
-                f,
-                "{}: manifest schema {found}, this build reads {MANIFEST_SCHEMA}",
-                path.display()
-            ),
             Self::KeyScheme { expected, found } => write!(
                 f,
                 "bundle uses key scheme {found:?}, this build uses {expected:?}"
@@ -761,17 +737,22 @@ impl fmt::Display for OpenError {
 impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            // Transparent, as its Display is.
+            Self::Manifest(err) => err.source(),
             Self::Io { source, .. } => Some(source),
-            Self::Parse { source, .. } => Some(source),
             Self::Invalid { source, .. } => Some(source),
-            Self::TooLarge { .. }
-            | Self::Schema { .. }
-            | Self::KeyScheme { .. }
+            Self::KeyScheme { .. }
             | Self::Missing { .. }
             | Self::UnknownFilter { .. }
             | Self::UnsafePath { .. }
             | Self::Mislabelled { .. } => None,
         }
+    }
+}
+
+impl From<ManifestError> for OpenError {
+    fn from(err: ManifestError) -> Self {
+        Self::Manifest(err)
     }
 }
 

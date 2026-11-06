@@ -212,8 +212,8 @@ pub enum LoadError {
     BadMagic,
     /// A layout version other than [`FORMAT_VERSION`].
     UnsupportedVersion(u16),
-    /// A header field is structurally invalid. The string names the field.
-    Corrupt(&'static str),
+    /// A header field holds a value the format does not allow.
+    Corrupt(HeaderField),
     /// More bits are set than a correctly sized filter could hold: `set` of
     /// `bits`. Such a filter is forged or corrupt, and would bless almost
     /// any key.
@@ -244,7 +244,7 @@ impl fmt::Display for LoadError {
             Self::UnsupportedVersion(v) => {
                 write!(f, "format v{v}, this build reads v{FORMAT_VERSION}")
             }
-            Self::Corrupt(field) => write!(f, "corrupt header field: {field}"),
+            Self::Corrupt(field) => write!(f, "corrupt header: {field}"),
             Self::Overfull { set, bits } => write!(
                 f,
                 "implausibly full bit array: {set} of {bits} bits set (max {MAX_FILL_PERCENT}%)"
@@ -259,6 +259,33 @@ impl fmt::Display for LoadError {
 }
 
 impl std::error::Error for LoadError {}
+
+/// The header field a [`LoadError::Corrupt`] filter got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeaderField {
+    /// The key kind is not one the format defines.
+    Kind,
+    /// The trust tier is not one the format defines.
+    Tier,
+    /// `k`, the probes per key, is out of range.
+    K,
+    /// `m`, the bits in the array, is not a large enough power of two.
+    M,
+    /// The reserved field is not zero.
+    Reserved,
+}
+
+impl fmt::Display for HeaderField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kind => f.write_str("unknown key kind"),
+            Self::Tier => f.write_str("unknown trust tier"),
+            Self::K => write!(f, "k outside 1..={MAX_K}"),
+            Self::M => write!(f, "m not a power of two of at least {MIN_BITS}"),
+            Self::Reserved => f.write_str("reserved field is nonzero"),
+        }
+    }
+}
 
 /// A parsed header: everything about a filter but its bits. The version is
 /// not kept: [`Header::parse`] accepts only [`FORMAT_VERSION`].
@@ -282,18 +309,18 @@ impl Header {
         if version != FORMAT_VERSION {
             return Err(LoadError::UnsupportedVersion(version));
         }
-        let kind = Kind::from_u8(head[6]).ok_or(LoadError::Corrupt("kind"))?;
-        let tier = Tier::from_u8(head[7]).ok_or(LoadError::Corrupt("tier"))?;
+        let kind = Kind::from_u8(head[6]).ok_or(LoadError::Corrupt(HeaderField::Kind))?;
+        let tier = Tier::from_u8(head[7]).ok_or(LoadError::Corrupt(HeaderField::Tier))?;
         let k = u32::from_le_bytes(bytes_at(head, 8));
         if k == 0 || k > MAX_K {
-            return Err(LoadError::Corrupt("k out of range"));
+            return Err(LoadError::Corrupt(HeaderField::K));
         }
         let m_bits = u64::from_le_bytes(bytes_at(head, 12));
         if m_bits < MIN_BITS || !m_bits.is_power_of_two() {
-            return Err(LoadError::Corrupt("m_bits not a power of two >= 64"));
+            return Err(LoadError::Corrupt(HeaderField::M));
         }
         if u64::from_le_bytes(bytes_at(head, 28)) != 0 {
-            return Err(LoadError::Corrupt("reserved field is nonzero"));
+            return Err(LoadError::Corrupt(HeaderField::Reserved));
         }
         Ok(Self {
             kind,
@@ -778,19 +805,26 @@ mod tests {
             );
         }
         // 2 is the withdrawn `url` kind, 3 the withdrawn `unknown-clean` tier.
-        assert_eq!(with(6, &[2]), Some(LoadError::Corrupt("kind")));
-        assert_eq!(with(7, &[3]), Some(LoadError::Corrupt("tier")));
+        assert_eq!(with(6, &[2]), Some(LoadError::Corrupt(HeaderField::Kind)));
+        assert_eq!(with(7, &[3]), Some(LoadError::Corrupt(HeaderField::Tier)));
         assert_eq!(
             with(8, &0u32.to_le_bytes()),
-            Some(LoadError::Corrupt("k out of range"))
+            Some(LoadError::Corrupt(HeaderField::K))
         );
-        assert!(matches!(
-            with(12, &8u64.to_le_bytes()),
-            Some(LoadError::Corrupt(_))
-        ));
+        for m in [0u64, 8, 63, 100] {
+            assert_eq!(
+                with(12, &m.to_le_bytes()),
+                Some(LoadError::Corrupt(HeaderField::M)),
+                "m={m}"
+            );
+        }
+        assert_eq!(
+            with(8, &(MAX_K + 1).to_le_bytes()),
+            Some(LoadError::Corrupt(HeaderField::K))
+        );
         assert_eq!(
             with(28, &1u64.to_le_bytes()),
-            Some(LoadError::Corrupt("reserved field is nonzero"))
+            Some(LoadError::Corrupt(HeaderField::Reserved))
         );
 
         let mut short = good;

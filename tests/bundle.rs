@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use burton::{
-    Artifact, Decision, KeySets, LoadError, Lookup, MANIFEST_FILE, OpenError, Record, Tier,
-    read_manifest, write_bundle,
+    Artifact, Decision, KeySets, LoadError, Lookup, MANIFEST_FILE, ManifestError, OpenError,
+    Record, Tier, read_manifest, write_bundle,
 };
 
 const SCHEME: &str = "test/v1";
@@ -240,7 +240,10 @@ fn a_manifest_of_another_schema_is_refused() {
     edit_manifest(dir.path(), |m| m.schema = 99);
     let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
     assert!(
-        matches!(err, OpenError::Schema { found: 99, .. }),
+        matches!(
+            err,
+            OpenError::Manifest(ManifestError::Schema { found: 99, .. })
+        ),
         "{err:?}"
     );
 }
@@ -296,7 +299,10 @@ fn a_bundle_that_names_no_scheme_is_refused() {
 
     for scheme in [SCHEME, "anything-at-all"] {
         let err = Lookup::open(dir.path(), scheme).unwrap_err();
-        assert!(matches!(err, OpenError::Parse { .. }), "{err:?}");
+        assert!(
+            matches!(err, OpenError::Manifest(ManifestError::Parse { .. })),
+            "{err:?}"
+        );
     }
 }
 
@@ -313,7 +319,8 @@ fn a_missing_manifest_is_not_a_bundle() {
     let dir = tempfile::tempdir().unwrap();
     let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
     assert!(
-        matches!(&err, OpenError::Io { path, .. } if path.ends_with(MANIFEST_FILE)),
+        matches!(&err, OpenError::Manifest(ManifestError::Io { path, .. })
+            if path.ends_with(MANIFEST_FILE)),
         "{err:?}"
     );
 }
@@ -324,7 +331,10 @@ fn an_unparseable_manifest_is_not_a_bundle() {
     publish(dir.path());
     std::fs::write(dir.path().join(MANIFEST_FILE), "this is not toml {{{").unwrap();
     let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
-    assert!(matches!(err, OpenError::Parse { .. }), "{err:?}");
+    assert!(
+        matches!(err, OpenError::Manifest(ManifestError::Parse { .. })),
+        "{err:?}"
+    );
     assert!(std::error::Error::source(&err).is_some());
 }
 
@@ -595,7 +605,10 @@ fn refresh_says_why_a_replacement_will_not_open() {
     std::fs::write(&path, "schema = 99").unwrap();
     let err = lk.refresh().unwrap_err();
     assert!(
-        matches!(err, OpenError::Schema { found: 99, .. }),
+        matches!(
+            err,
+            OpenError::Manifest(ManifestError::Schema { found: 99, .. })
+        ),
         "{err:?}"
     );
     assert_eq!(
@@ -610,7 +623,8 @@ fn refresh_says_why_a_replacement_will_not_open() {
     std::fs::remove_file(&path).unwrap();
     let err = lk.refresh().unwrap_err();
     assert!(
-        matches!(&err, OpenError::Io { path, .. } if path.ends_with(MANIFEST_FILE)),
+        matches!(&err, OpenError::Manifest(ManifestError::Io { path, .. })
+            if path.ends_with(MANIFEST_FILE)),
         "{err:?}"
     );
 

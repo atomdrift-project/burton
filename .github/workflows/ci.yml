@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,20 +19,31 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned by commit; Dependabot keeps the pins current.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: make lint
         if: matrix.os == 'ubuntu-latest'
+      # Formatting and docs do not vary by platform; the cfg(not(unix)) code
+      # paths do, and only clippy on that platform sees them.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        if: matrix.os != 'ubuntu-latest'
       - run: cargo test --locked
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install 1.88.0 --profile minimal
       - run: cargo +1.88.0 test --locked

@@ -80,13 +80,14 @@
 mod bundle;
 mod filter;
 mod lookup;
+mod manifest;
 
 pub use bundle::{
-    Entry, KeySets, MANIFEST_FILE, MANIFEST_SCHEMA, Manifest, Ratio, Record, VerifyError,
-    WriteError, read_manifest, verify, write_bundle,
+    KeySets, Ratio, RatioBreach, Record, VerifyError, WriteError, verify, write_bundle,
 };
-pub use filter::{FORMAT_VERSION, Filter, Kind, LoadError, Tier};
+pub use filter::{FORMAT_VERSION, Filter, HeaderField, Kind, LoadError, Tier};
 pub use lookup::{Artifact, Decision, Lookup, OpenError};
+pub use manifest::{Entry, MANIFEST_FILE, MANIFEST_SCHEMA, Manifest, ManifestError, read_manifest};
 
 /// Key scheme for bundles whose keys are raw byte strings.
 ///
@@ -99,8 +100,10 @@ pub const KEY_SCHEME_OPAQUE: &str = "opaque";
 /// Parse a 64-character hex SHA-256, as manifests and most corpora spell it,
 /// into the 32 bytes [`Record`] and [`Artifact`] take.
 ///
-/// `None` for any wrong length or non-hex character, so a malformed row is
-/// skipped rather than silently hashed as text.
+/// Either case is accepted, and surrounding whitespace, such as the newline
+/// of a line read from a file, is ignored. `None` for any other length or a
+/// non-hex character, so a malformed row is skipped rather than silently
+/// hashed as text.
 #[must_use]
 pub fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
     let (pairs, rest) = s.trim().as_bytes().as_chunks::<2>();
