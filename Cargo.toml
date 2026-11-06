@@ -11,7 +11,7 @@ documentation = "https://docs.rs/burton"
 readme = "README.md"
 keywords = ["bloom-filter", "allowlist", "supply-chain", "scanner"]
 categories = ["data-structures", "filesystem"]
-include = ["/src", "/tests", "/benches", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SECURITY.md"]
+include = ["/src", "/tests", "/benches", "/README.md", "/LICENSE", "/CHANGELOG.md", "/FORMAT.md", "/SECURITY.md"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

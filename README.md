@@ -35,7 +35,8 @@ package URLs. An installer should check each file against its manifest
 digest, run Filter::load on it, and rename the directory into place.
 
 To build a bundle, feed records to KeySets, run verify, then write_bundle.
-The file format is described in src/filter.rs. `make test` enforces memory
+The file and manifest formats are specified in [FORMAT.md](FORMAT.md), enough
+to produce or read a bundle in another language. `make test` enforces memory
 budgets; `make bench-check` fails on a regression against a saved baseline.
 Report security problems as described in SECURITY.md.
 

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -180,10 +180,12 @@ pub struct Manifest {
 /// [`KeySets::into_filters`] returns: a bundle missing one would be refused
 /// by every reader, so it is refused here before anything is written.
 ///
-/// Each file is written to a temporary name, synced, and renamed into place,
-/// so no reader ever sees a partly written file and the manifest is replaced
-/// last. Files are still replaced one at a time: to swap a live bundle as a
-/// whole, write into a fresh directory and rename that.
+/// Each file is written to a fresh temporary name, synced, and renamed into
+/// place, so no reader ever sees a partly written file. The filters' renames
+/// are made durable before the manifest is replaced, so after a crash the
+/// manifest never names filters that were lost. Files are still replaced one
+/// at a time: to swap a live bundle as a whole, write into a fresh directory
+/// and rename that. Write a directory from one process at a time.
 ///
 /// `key_scheme` is recorded so a consumer using a different one fails at open
 /// instead of matching nothing. Run [`verify`] first: nothing here does.
@@ -218,7 +220,7 @@ pub fn write_bundle(
     for filter in filters {
         let stem = filter.stem();
         let file = format!("{stem}.adbl");
-        write_atomic(&dir.join(&file), filter.as_bytes())?;
+        write_atomic(dir, &file, filter.as_bytes())?;
         entries.insert(
             stem.to_owned(),
             Entry {
@@ -228,6 +230,7 @@ pub fn write_bundle(
             },
         );
     }
+    sync_dir(dir)?;
     let manifest = Manifest {
         schema: MANIFEST_SCHEMA,
         built: built.to_owned(),
@@ -235,27 +238,59 @@ pub fn write_bundle(
         filter: entries,
     };
     let text = toml::to_string(&manifest).map_err(|source| WriteError::Serialize { source })?;
-    write_atomic(&dir.join(MANIFEST_FILE), text.as_bytes())?;
+    write_atomic(dir, MANIFEST_FILE, text.as_bytes())?;
+    sync_dir(dir)?;
     Ok(manifest)
 }
 
-/// Write `bytes` beside `path`, sync, and rename over it.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
-    let tmp = path.with_extension("tmp");
-    let written = File::create(&tmp)
-        .and_then(|mut f| {
-            f.write_all(bytes)?;
-            f.sync_all()
+/// Write `bytes` to `dir/file`: to a temporary file beside it, synced, then
+/// renamed over it.
+///
+/// The temporary file is hidden and named for this process. No live process
+/// can own that name, so anything already there was left by a crash under a
+/// reused process id, or planted: it is unlinked, which never follows a
+/// symlink, and the file is created only if nothing has taken the name since.
+fn write_atomic(dir: &Path, file: &str, bytes: &[u8]) -> Result<(), WriteError> {
+    let path = dir.join(file);
+    let tmp = dir.join(format!(".{file}.{}.tmp", std::process::id()));
+    let io_err = |source| WriteError::Io {
+        path: path.clone(),
+        source,
+    };
+
+    if let Err(e) = std::fs::remove_file(&tmp)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(io_err(e));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_err)?;
+    let synced = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    synced
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|source| {
+            // Best effort: the error being reported is the write's, not this.
+            let _ = std::fs::remove_file(&tmp);
+            io_err(source)
         })
-        .and_then(|()| std::fs::rename(&tmp, path));
-    written.map_err(|source| {
-        // Best effort: the error being reported is the write's, not this.
-        let _ = std::fs::remove_file(&tmp);
-        WriteError::Io {
-            path: path.to_owned(),
-            source,
-        }
-    })
+}
+
+/// Make the renames into `dir` durable. Unix syncs a directory like a file;
+/// std offers no way to on Windows, where a rename is only atomic.
+fn sync_dir(dir: &Path) -> Result<(), WriteError> {
+    if cfg!(unix) {
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|source| WriteError::Io {
+                path: dir.to_owned(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 /// Read the manifest in `dir`, typically a previous build to size a new one
@@ -691,6 +726,41 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!(names, want);
+    }
+
+    /// A symlink planted at the temporary name, to make the writer clobber a
+    /// file outside the bundle, is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temporary_file_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("precious");
+        std::fs::write(&target, "untouched").unwrap();
+        let planted = dir
+            .path()
+            .join(format!(".purl-good.adbl.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+
+        let filters = KeySets::new().into_filters(1e-9);
+        write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(crate::Lookup::open(dir.path(), "test/v1").is_ok());
+    }
+
+    /// A crash leaves its temporary file behind. Under a reused process id —
+    /// every run, in a container — the next write must not fail on it.
+    #[test]
+    fn a_stale_temporary_file_does_not_block_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir
+            .path()
+            .join(format!(".{MANIFEST_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&stale, "half a manifest").unwrap();
+
+        let filters = KeySets::new().into_filters(1e-9);
+        write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap();
+        assert!(!stale.exists());
+        assert!(crate::Lookup::open(dir.path(), "test/v1").is_ok());
     }
 
     #[test]

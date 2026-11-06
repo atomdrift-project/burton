@@ -33,7 +33,8 @@ pub enum Decision {
     Conflicted,
     /// Blessed, claimed by nothing, and revocable. The only skippable value.
     Skip,
-    /// Nothing is known, or a blessing had no revocation channel. Scan.
+    /// Nothing claims this artifact, and not every key supplied is blessed.
+    /// Scan.
     Unknown,
     /// No filter that could be read claims this artifact, but one could not
     /// be read when consulted, so nothing may be blessed. Scan, and look at

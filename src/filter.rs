@@ -1,40 +1,8 @@
-//! The on-disk filter: a self-describing header followed by a bit array.
+//! The on-disk filter: a 36-byte header followed by a bit array.
 //!
-//! # Layout
-//!
-//! All integers are little-endian. The header is 36 bytes:
-//!
-//! ```text
-//! offset  size  field
-//!      0     4  magic, always "ADBL"
-//!      4     2  format version
-//!      6     1  key kind      (see Kind)
-//!      7     1  trust tier    (see Tier)
-//!      8     4  k, hash functions per key
-//!     12     8  m, bits in the array; always a power of two
-//!     20     8  n, keys inserted at build time (informational)
-//!     28     8  reserved, always zero
-//! ```
-//!
-//! The bit array follows, exactly `m / 8` bytes of it.
-//!
-//! # Hashing
-//!
-//! A key is reduced to a 32-byte SHA-256 digest, from which `k` indices are
-//! derived by double hashing: `i_j = (h1 + j*h2) mod m`, `h1` and `h2` being the
-//! digest's first two 64-bit lanes with `h2` forced odd so it is coprime with
-//! the modulus. A [`Kind::Sha256`] key is already uniform and is used directly.
-//!
-//! SHA-256 is identical everywhere, so a producer in another language agrees bit
-//! for bit if it canonicalizes keys the same way. Nothing here checks that; the
-//! bundle's key scheme does (see [`crate::Lookup::open`]).
-//!
-//! # Reading is strict
-//!
-//! [`Filter::load`] rejects rather than interprets: wrong magic, any version
-//! but [`FORMAT_VERSION`], `k` or `m` out of bounds, a nonzero reserved field,
-//! a bit array whose length disagrees with the header, or one too full or too
-//! permissive (`fill^k`) for any correctly sized filter to be.
+//! The layout, probe derivation, and load checks are specified in
+//! `FORMAT.md` at the crate root; this module implements it. Reading is
+//! strict: anything the format does not allow is rejected, never interpreted.
 
 use std::fmt;
 use std::fs::File;

@@ -61,6 +61,14 @@
 //! Supply every key you have: blessings are conjunctive, and owning a blessed
 //! package coordinate is not cheap.
 //!
+//! # Format
+//!
+//! The filter and manifest formats, their versioning, and how to write and
+//! install a bundle are specified in
+//! [`FORMAT.md`](https://github.com/atomdrift-project/burton/blob/main/FORMAT.md),
+//! enough to produce or read a bundle in another language. [`FORMAT_VERSION`]
+//! and [`MANIFEST_SCHEMA`] are the versions this build reads and writes.
+//!
 //! # Not included
 //!
 //! Fetching, authenticating, and installing bundles. Key canonicalization, which

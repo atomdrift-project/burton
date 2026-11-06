@@ -6,54 +6,40 @@ All notable changes to this crate are documented here. The format follows
 
 ## [Unreleased]
 
-First public release.
+Initial release, as 0.1.0.
 
-### Wire format
+### Formats
 
-- Filter format v2, readable alongside v1. The reserved header field must be
-  zero; a filter with anything else there is refused.
-- Manifest schema 1. `Lookup::open` refuses any other schema, a filter `file`
-  that is not a bare file name, and a filter whose header version disagrees
-  with its manifest entry.
+- Filter format 2 and manifest schema 2, specified in `FORMAT.md`. A reader
+  accepts exactly these versions, and a bundle carries exactly one filter for
+  each key kind (`purl`, `sha256`) and trust tier (`good`, `bad`,
+  `sighted-hostile`, `sighted-suspicious`).
 
-### Behaviour
+### Consuming
 
-- Every filter is consulted for every key and the worst claim wins. A filter
-  that cannot be read blesses nothing but no longer erases another filter's
-  claim; with no claim, the result is the new `Decision::Unavailable`.
-- An open `Lookup` checks the manifest's identity once per decision and
-  reopens the bundle whole when it has been replaced. On Unix it holds its
-  filters open, so a decision costs a `stat` and positional reads instead of
-  opening every filter, and always reads a single build. Other platforms still
-  reopen the filters per decision, so no handle blocks an updater.
-- `write_bundle` writes each file to a temporary name, syncs, and renames it
-  into place, with the manifest last.
-- `verify` refuses a vouched digest found in any adverse tier, not only `bad`.
-- A `target_fp` looser than `1e-3` is clamped to `1e-3` rather than replaced
-  by `1e-9`.
-- Purl keys are held as their 32-byte digests while building, so memory no
-  longer grows with purl length.
+- `Lookup::open` opens a bundle whole or not at all, and refuses one built
+  under another key scheme.
+- `Lookup::decide` consults every filter for every key: the worst claim wins,
+  and a skip needs every key supplied to be blessed. `Decision::may_skip` is
+  the one question a fast path should ask.
+- Filters stay on disk, and a decision reads only the bytes its probes touch.
+  On Unix it does so through filters held open, without allocating.
+- An open `Lookup` follows its bundle as it is replaced, and `Lookup::refresh`
+  reports why a replacement will not open.
+
+### Producing
+
+- `KeySets` accumulates records as 32-byte digests and builds the eight
+  filters, removing from `good` anything any other tier claims.
+- `verify` refuses a build that blesses a canary, convicts a vouched digest,
+  drops or empties a filter, or moves a filter's key count outside its ratio
+  bounds (waivable with `Ratio::Waive`).
+- `write_bundle` writes each file atomically and durably, the manifest last.
+- `Filter::load` runs the full check, bit fill included, that an installer
+  should apply to every downloaded filter.
 
 ### Tooling
 
-- `make bench` / `bench-save` / `bench-check`: timings, exact allocation
-  counts, and peak heap per operation, with baseline comparison.
+- `make bench`, `bench-save`, and `bench-check` report timings, exact
+  allocation counts, and peak heap per operation, against a saved baseline.
 - `tests/budget.rs` asserts allocation and memory budgets on every test run.
-
-### API
-
-- One flat namespace: the `build` module is gone, and everything it held is
-  exported from the crate root.
-- `read_manifest` returns `Result<Option<Manifest>, OpenError>`: only an absent
-  manifest is `None`.
-- `KeySets::into_filters_for` returns `Result<_, UnsupportedVersion>`.
-- `verify` takes `Ratio::{Enforce, Waive}` instead of a `bool`.
-- `OpenError`, `WriteError`, and `VerifyError` use struct variants and expose
-  their underlying errors through `source()`. `KeySchemeError` is folded into
-  `OpenError::KeyScheme`.
-- `Lookup::keys` is renamed `Lookup::key_count`.
-- `Record::purl` and `Record::sha256` constructors.
-- `Display` for `Kind`, `Tier`, and `Decision`; `Default` for `Lookup`.
-- `VerifyError::Ratio` carries the key counts (`was`, `now`) rather than a
-  preformatted message; its `Display` text is unchanged.
-- `hex` is no longer public. `Filter` is no longer `Clone`.
