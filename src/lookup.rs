@@ -5,8 +5,8 @@ use std::fmt;
 use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard};
-use std::time::SystemTime;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, MAX_MANIFEST_LEN, load_manifest};
 use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of, stem};
@@ -210,7 +210,10 @@ impl<'a> Artifact<'a> {
 /// An open bundle follows its directory. Each decision checks the manifest's
 /// identity — a single `stat` — and reopens the whole bundle when it has been
 /// replaced, as [`write_bundle`] and a directory swap both do. A replacement
-/// that will not open yields [`Decision::Unavailable`] until one does. On Unix
+/// that will not open yields [`Decision::Unavailable`] until one does: it is
+/// tried again when its manifest changes, or once a second has passed, and
+/// never by more than one thread at a time. [`Lookup::refresh`] tries at once
+/// and says what is wrong. On Unix
 /// the filter files are held open, so decisions always read one build.
 /// Elsewhere no handle is held between decisions, so an updater can rename the
 /// directory out from under an open bundle; each decision reopens the filters
@@ -230,7 +233,39 @@ struct Bundle {
     manifest: PathBuf,
     /// The key scheme required at open, and so of every generation since.
     scheme: String,
-    current: RwLock<Generation>,
+    current: RwLock<State>,
+}
+
+/// How long a manifest that failed to open is left alone before a decision
+/// tries it again. A replacement normally fixes itself by being replaced,
+/// which is retried at once; this bounds the cost of one that never is.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The generation decisions read, and how the last reopen went.
+#[derive(Debug)]
+struct State {
+    generation: Generation,
+    /// Set while the manifest in place is one that failed to open.
+    failed: Option<Failure>,
+}
+
+/// A reopen that failed: of which manifest, and when.
+#[derive(Debug, Clone, Copy)]
+struct Failure {
+    manifest: FileId,
+    at: Instant,
+}
+
+impl State {
+    fn is_for(&self, manifest: FileId) -> bool {
+        self.generation.manifest == manifest
+    }
+
+    /// Whether `manifest` failed to open too recently to try again.
+    fn deferring(&self, manifest: FileId) -> bool {
+        self.failed
+            .is_some_and(|f| f.manifest == manifest && f.at.elapsed() < RETRY_AFTER)
+    }
 }
 
 /// One opened build of a bundle.
@@ -330,8 +365,8 @@ impl FileId {
         }
     }
 
-    fn now(path: &Path) -> Option<Self> {
-        std::fs::metadata(path).ok().map(|m| Self::of(&m))
+    fn now(path: &Path) -> io::Result<Self> {
+        std::fs::metadata(path).map(|m| Self::of(&m))
     }
 }
 
@@ -471,7 +506,10 @@ impl Lookup {
                 dir: dir.to_owned(),
                 manifest: dir.join(MANIFEST_FILE),
                 scheme: scheme.to_owned(),
-                current: RwLock::new(generation),
+                current: RwLock::new(State {
+                    generation,
+                    failed: None,
+                }),
             }),
         })
     }
@@ -488,7 +526,22 @@ impl Lookup {
         };
         bundle
             .current()
-            .map_or(Decision::Unavailable, |g| g.decide(artifact))
+            .map_or(Decision::Unavailable, |s| s.generation.decide(artifact))
+    }
+
+    /// Bring the bundle up to date now, and say why it cannot be.
+    ///
+    /// [`Lookup::decide`] does this itself, quietly: a replacement that will
+    /// not open makes decisions [`Decision::Unavailable`], and is retried only
+    /// when its manifest changes or a second has passed. Call this to retry at
+    /// once and learn why — to log it after an `Unavailable`, say. `Ok` for
+    /// [`Lookup::empty`], which has nothing to refresh.
+    ///
+    /// # Errors
+    /// What [`Lookup::open`] would return for the bundle in place, including
+    /// [`OpenError::Io`] when its manifest is gone.
+    pub fn refresh(&self) -> Result<(), OpenError> {
+        self.bundle.as_ref().map_or(Ok(()), Bundle::refresh)
     }
 
     /// Whether this artifact may be skipped.
@@ -503,11 +556,15 @@ impl Lookup {
         self.bundle.is_some()
     }
 
-    /// Total keys across every filter, as their headers record them.
+    /// Total keys across the filters a decision would read now, as their
+    /// headers record them; 0 when the bundle in place will not open.
     #[must_use]
     pub fn key_count(&self) -> u64 {
-        self.bundle.as_ref().map_or(0, |b| {
-            b.read().slots.iter().map(|slot| slot.header().n).sum()
+        let Some(bundle) = &self.bundle else {
+            return 0;
+        };
+        bundle.current().map_or(0, |s| {
+            s.generation.slots.iter().map(|slot| slot.header().n).sum()
         })
     }
 
@@ -520,24 +577,75 @@ impl Lookup {
 }
 
 impl Bundle {
-    /// The generation to decide with: the one open, if its manifest is still
-    /// the one in place, or else a fresh one. `None` when the bundle in place
-    /// cannot be opened; the next call tries again.
-    fn current(&self) -> Option<RwLockReadGuard<'_, Generation>> {
+    /// The state to decide with: the generation open, if its manifest is
+    /// still the one in place, or else a fresh one. `None` when the bundle in
+    /// place cannot be opened, or failed to too recently to try again.
+    fn current(&self) -> Option<RwLockReadGuard<'_, State>> {
+        let manifest = FileId::now(&self.manifest).ok()?;
         let held = self.read();
-        if FileId::now(&self.manifest)? == held.manifest {
+        if held.is_for(manifest) {
             return Some(held);
         }
+        if held.deferring(manifest) {
+            return None;
+        }
         drop(held);
-        let fresh = Generation::open(&self.dir, &self.scheme).ok()?;
-        *self.current.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+
+        let mut state = self.write();
+        // Another thread may have reopened it, or failed to, while this one
+        // waited for the lock. Either way, once is enough.
+        if !state.is_for(manifest) {
+            if state.deferring(manifest) {
+                return None;
+            }
+            self.reopen(&mut state, manifest).ok()?;
+        }
+        drop(state);
         Some(self.read())
     }
 
-    fn read(&self) -> RwLockReadGuard<'_, Generation> {
-        // Nothing panics while holding the lock, and a generation is replaced
-        // whole, so a poisoned one is still consistent.
+    /// [`Lookup::refresh`]: [`Self::current`], without the deferral, and
+    /// with the reason.
+    fn refresh(&self) -> Result<(), OpenError> {
+        let manifest = FileId::now(&self.manifest).map_err(|source| OpenError::Io {
+            path: self.manifest.clone(),
+            source,
+        })?;
+        let mut state = self.write();
+        if state.is_for(manifest) {
+            return Ok(());
+        }
+        self.reopen(&mut state, manifest)
+    }
+
+    /// Replace the generation with the bundle in place, whose manifest is
+    /// `manifest`, or record that it would not open.
+    fn reopen(&self, state: &mut State, manifest: FileId) -> Result<(), OpenError> {
+        match Generation::open(&self.dir, &self.scheme) {
+            Ok(fresh) => {
+                state.generation = fresh;
+                state.failed = None;
+                Ok(())
+            }
+            Err(err) => {
+                state.failed = Some(Failure {
+                    manifest,
+                    at: Instant::now(),
+                });
+                Err(err)
+            }
+        }
+    }
+
+    /// Nothing panics while holding the lock, and a generation is replaced
+    /// whole, so a poisoned state is still consistent. So too for
+    /// [`Self::write`].
+    fn read(&self) -> RwLockReadGuard<'_, State> {
         self.current.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, State> {
+        self.current.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

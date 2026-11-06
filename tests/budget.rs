@@ -14,7 +14,7 @@ mod support {
 
 use std::path::Path;
 
-use burton::{Artifact, Filter, KeySets, Lookup, Record, Tier, write_bundle};
+use burton::{Artifact, Decision, Filter, KeySets, Lookup, Record, Tier, write_bundle};
 use support::alloc::{Counting, measure};
 
 #[global_allocator]
@@ -86,6 +86,31 @@ fn a_decision_does_not_allocate() {
             "{artifact:?} -> {decision:?} allocated: {usage:?}"
         );
     }
+}
+
+/// A replacement that will not open is retried when its manifest changes or
+/// a second passes, not on every decision: until then a decision costs a
+/// `stat`, where a retry would cost about as much as an open.
+#[test]
+fn a_broken_replacement_is_not_reopened_on_every_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path(), 1_000);
+    let lk = Lookup::open(dir.path(), SCHEME).unwrap();
+    let (_, open) = measure(|| Lookup::open(dir.path(), SCHEME).unwrap());
+
+    // A new build whose last filter never lands: every other one opens
+    // before the reopen fails, so a retry is as dear as an open.
+    publish(dir.path(), 1_000);
+    std::fs::remove_file(dir.path().join("sha256-sighted-suspicious.adbl")).unwrap();
+    let miss = digest(3, 9);
+    assert_eq!(lk.decide(&Artifact::sha256(&miss)), Decision::Unavailable);
+
+    let (decision, usage) = measure(|| lk.decide(&Artifact::sha256(&miss)));
+    assert_eq!(decision, Decision::Unavailable);
+    assert!(
+        usage.allocs * 4 < open.allocs,
+        "deferred {usage:?}, open {open:?}"
+    );
 }
 
 #[test]

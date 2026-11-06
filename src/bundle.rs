@@ -298,6 +298,20 @@ pub(crate) fn load_manifest(dir: &Path) -> Result<(Manifest, Metadata), OpenErro
     let manifest: Manifest = match toml::from_str(&text) {
         Ok(m) => m,
         Err(source) => {
+            // A manifest of another schema need not parse as this one. Say
+            // which schema it is, rather than which field this one lacks.
+            #[derive(Deserialize)]
+            struct Versioned {
+                schema: u32,
+            }
+            if let Ok(Versioned { schema }) = toml::from_str(&text)
+                && schema != MANIFEST_SCHEMA
+            {
+                return Err(OpenError::Schema {
+                    path,
+                    found: schema,
+                });
+            }
             return Err(OpenError::Parse {
                 path,
                 source: Box::new(source),
@@ -752,6 +766,29 @@ mod tests {
             read_manifest(dir.path()),
             Err(OpenError::Schema { found, .. }) if found == MANIFEST_SCHEMA + 1
         ));
+    }
+
+    /// A manifest from another schema is reported as one, however different
+    /// its shape — not as this schema's missing or unknown fields.
+    #[test]
+    fn another_schema_is_named_whatever_its_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+        for text in [
+            "schema = 1",
+            "schema = 3\nfilters = []",
+            "schema = 1\nbuilt = 7",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                matches!(read_manifest(dir.path()), Err(OpenError::Schema { .. })),
+                "{text}"
+            );
+        }
+        // Our own schema, malformed, is a parse error that says what is wrong.
+        std::fs::write(&path, "schema = 2").unwrap();
+        let err = read_manifest(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("built"), "{err}");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burton::{
     Artifact, Decision, KeySets, LoadError, Lookup, MANIFEST_FILE, OpenError, Record, Tier,
@@ -580,6 +580,89 @@ fn a_broken_replacement_is_unavailable_until_it_is_fixed() {
     std::fs::write(dir.path().join(MANIFEST_FILE), manifest).unwrap();
     assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
     assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
+}
+
+/// What decisions only report as `Unavailable`, refresh explains.
+#[test]
+fn refresh_says_why_a_replacement_will_not_open() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+    lk.refresh().unwrap();
+
+    let path = dir.path().join(MANIFEST_FILE);
+    let manifest = std::fs::read(&path).unwrap();
+    std::fs::write(&path, "schema = 99").unwrap();
+    let err = lk.refresh().unwrap_err();
+    assert!(
+        matches!(err, OpenError::Schema { found: 99, .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        lk.decide(&Artifact::sha256(&digest(1))),
+        Decision::Unavailable
+    );
+
+    std::fs::write(&path, manifest).unwrap();
+    lk.refresh().unwrap();
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+
+    std::fs::remove_file(&path).unwrap();
+    let err = lk.refresh().unwrap_err();
+    assert!(
+        matches!(&err, OpenError::Io { path, .. } if path.ends_with(MANIFEST_FILE)),
+        "{err:?}"
+    );
+
+    Lookup::empty().refresh().unwrap();
+}
+
+/// Swap in, under the bundle `lk` has open, one that catalogues digest 1 but
+/// whose `purl-bad` filter has not landed yet. Returns where that filter is
+/// waiting.
+fn swap_in_incomplete(root: &Path, live: &Path) -> PathBuf {
+    let staged = root.join("staged");
+    std::fs::create_dir(&staged).unwrap();
+    publish_one(&staged, Tier::Bad, Record::sha256(digest(1)));
+    let waiting = root.join("purl-bad.adbl");
+    std::fs::rename(staged.join("purl-bad.adbl"), &waiting).unwrap();
+    std::fs::rename(live, root.join("old")).unwrap();
+    std::fs::rename(&staged, live).unwrap();
+    waiting
+}
+
+/// A replacement that fails to open is not retried on every decision. With
+/// its manifest unchanged, it is retried after a second, or at once by
+/// refresh.
+#[test]
+fn a_replacement_completed_in_place_is_picked_up_on_retry() {
+    for retry_now in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("bundle");
+        std::fs::create_dir(&live).unwrap();
+        publish(&live);
+        let lk = open(&live);
+        assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+
+        let waiting = swap_in_incomplete(root.path(), &live);
+        assert_eq!(
+            lk.decide(&Artifact::sha256(&digest(1))),
+            Decision::Unavailable
+        );
+        std::fs::rename(waiting, live.join("purl-bad.adbl")).unwrap();
+        // The file is in place, but this manifest failed moments ago.
+        assert_eq!(
+            lk.decide(&Artifact::sha256(&digest(1))),
+            Decision::Unavailable
+        );
+
+        if retry_now {
+            lk.refresh().unwrap();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+        }
+        assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::KnownBad);
+    }
 }
 
 /// A bundle swapped in as a whole directory, as an installer does it, is

@@ -12,12 +12,19 @@
 //! # let digest = [0u8; 32];
 //! # let purl = "pkg:npm/left-pad@1.3.0";
 //! // Once at startup: open the installed bundle, or run without one.
-//! let lookup = Lookup::open(bundle_dir, "purl-identity/v1")
-//!     .unwrap_or_else(|_| Lookup::empty());
+//! let lookup = Lookup::open(bundle_dir, "purl-identity/v1").unwrap_or_else(|err| {
+//!     eprintln!("no bundle, scanning everything: {err}");
+//!     Lookup::empty()
+//! });
 //!
 //! // Per artifact, before the expensive work, with every key you have.
 //! if !lookup.may_skip(&Artifact::sha256(&digest).and_purl(purl)) {
 //!     // analyze it
+//! }
+//!
+//! // Now and then, to hear about a replacement bundle that will not open.
+//! if let Err(err) = lookup.refresh() {
+//!     eprintln!("bundle unavailable, scanning everything: {err}");
 //! }
 //! ```
 //!

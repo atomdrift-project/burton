@@ -5,8 +5,10 @@ bundle of Bloom filters, one per key kind (purl, sha256) and trust tier
 (good, bad, sighted-hostile, sighted-suspicious).
 
 ```rust
-let lookup = Lookup::open(dir, "purl-identity/v1")
-    .unwrap_or_else(|_| Lookup::empty());
+let lookup = Lookup::open(dir, "purl-identity/v1").unwrap_or_else(|err| {
+    eprintln!("no bundle, scanning everything: {err}");
+    Lookup::empty()
+});
 if !lookup.may_skip(&Artifact::sha256(&digest).and_purl(purl)) {
     analyze(path)?;
 }
@@ -18,9 +20,10 @@ and nothing claims it. When in doubt, burton says scan.
 
 Failure is safe. A bundle missing any filter does not open, and a bundle that
 does not open completely grants nothing. A filter that cannot be read blesses
-nothing and hides no claim. On Unix, an open bundle notices a replaced
-manifest and reopens itself. A bundle records
-its key scheme, and Lookup::open refuses one that does not match.
+nothing and hides no claim. An open bundle notices a replaced manifest and
+reopens itself; a replacement that will not open makes every decision
+Unavailable, and Lookup::refresh says why. A bundle records its key scheme,
+and Lookup::open refuses one that does not match.
 
 Bloom filters are public, and so is their false-positive set. An attacker can
 grind a digest into the good filter. Supply every key you have: a blessing
