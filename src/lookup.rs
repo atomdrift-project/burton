@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 use std::time::SystemTime;
 
-use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, load_manifest};
-use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of};
+use crate::bundle::{MANIFEST_FILE, MANIFEST_SCHEMA, MAX_MANIFEST_LEN, load_manifest};
+use crate::filter::{Header, Kind, LoadError, OnDisk, OnDiskError, Tier, digest_of, stem};
 
 /// What to do with an artifact before spending real work on it.
 ///
@@ -219,28 +219,29 @@ impl<'a> Artifact<'a> {
 /// [`write_bundle`]: crate::write_bundle
 #[derive(Debug)]
 pub struct Lookup {
-    /// Where the bundle lives; `None` for [`Lookup::empty`].
-    source: Option<Source>,
-    current: RwLock<Generation>,
-    /// The key scheme the bundle recorded when first opened.
-    scheme: Option<String>,
+    /// `None` for [`Lookup::empty`].
+    bundle: Option<Bundle>,
 }
 
-/// What a [`Lookup`] needs to reopen its bundle.
+/// An opened bundle, and what it takes to reopen it.
 #[derive(Debug)]
-struct Source {
+struct Bundle {
     dir: PathBuf,
     manifest: PathBuf,
+    /// The key scheme required at open, and so of every generation since.
     scheme: String,
+    current: RwLock<Generation>,
 }
 
 /// One opened build of a bundle.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Generation {
-    /// `slots[kind][tier]`, so no tier can be reached except by index.
-    slots: [[Option<Slot>; Tier::ALL.len()]; Kind::ALL.len()],
-    /// The manifest this generation was opened from; `None` for an empty one.
-    manifest: Option<FileId>,
+    /// One slot per (kind, tier), kind-major in [`Kind::ALL`] and
+    /// [`Tier::ALL`] order. Never partial: [`Generation::open`] refuses a
+    /// bundle missing any.
+    slots: Vec<Slot>,
+    /// The manifest this generation was opened from.
+    manifest: FileId,
 }
 
 /// One filter of an opened bundle, held open for the generation's life.
@@ -336,53 +337,54 @@ impl FileId {
 
 impl Generation {
     /// Open the bundle in `dir`: the rules of [`Lookup::open`].
-    fn open(dir: &Path, scheme: &str) -> Result<(Self, Option<String>), OpenError> {
-        let (manifest, meta) = load_manifest(dir)?;
-
-        if let Some(found) = manifest.key_scheme.as_deref()
-            && found != scheme
-        {
+    fn open(dir: &Path, scheme: &str) -> Result<Self, OpenError> {
+        let (mut manifest, meta) = load_manifest(dir)?;
+        if manifest.key_scheme != scheme {
             return Err(OpenError::KeyScheme {
                 expected: scheme.to_owned(),
-                found: found.to_owned(),
+                found: manifest.key_scheme,
             });
         }
 
-        let mut generation = Self {
-            slots: Default::default(),
-            manifest: Some(FileId::of(&meta)),
-        };
-        for (stem, entry) in manifest.filter {
-            let file = entry.file;
-            if Path::new(&file).file_name() != Some(OsStr::new(&file)) {
-                return Err(OpenError::UnsafePath { file });
-            }
-            let path = dir.join(&file);
-            let filter = match OnDisk::open(&path) {
-                Ok(filter) => filter,
-                Err(OnDiskError::Io(source)) => return Err(OpenError::Io { path, source }),
-                Err(OnDiskError::Invalid(source)) => {
-                    return Err(OpenError::Invalid { file, source });
+        let mut slots = Vec::with_capacity(Kind::ALL.len() * Tier::ALL.len());
+        for kind in Kind::ALL {
+            for tier in Tier::ALL {
+                let name = stem(kind, tier);
+                let Some(entry) = manifest.filter.remove(name) else {
+                    return Err(OpenError::Missing {
+                        stem: name.to_owned(),
+                    });
+                };
+                let file = entry.file;
+                if Path::new(&file).file_name() != Some(OsStr::new(&file)) {
+                    return Err(OpenError::UnsafePath { file });
                 }
-            };
-            let header = *filter.header();
-            if !header.has_stem(&stem) {
-                return Err(OpenError::Mislabelled {
-                    file,
-                    claims: header.stem(),
-                });
+                let path = dir.join(&file);
+                let filter = match OnDisk::open(&path) {
+                    Ok(filter) => filter,
+                    Err(OnDiskError::Io(source)) => return Err(OpenError::Io { path, source }),
+                    Err(OnDiskError::Invalid(source)) => {
+                        return Err(OpenError::Invalid { file, source });
+                    }
+                };
+                let header = filter.header();
+                if (header.kind, header.tier) != (kind, tier) {
+                    return Err(OpenError::Mislabelled {
+                        file,
+                        claims: stem(header.kind, header.tier).to_owned(),
+                    });
+                }
+                slots.push(Slot::new(path, filter));
             }
-            if header.version != entry.format_version {
-                return Err(OpenError::VersionMismatch {
-                    file,
-                    manifest: entry.format_version,
-                    header: header.version,
-                });
-            }
-            generation.slots[header.kind.index()][header.tier.index()] =
-                Some(Slot::new(path, filter));
         }
-        Ok((generation, manifest.key_scheme))
+        // Whatever is left names no slot this build has.
+        if let Some(stem) = manifest.filter.into_keys().next() {
+            return Err(OpenError::UnknownFilter { stem });
+        }
+        Ok(Self {
+            slots,
+            manifest: FileId::of(&meta),
+        })
     }
 
     fn decide(&self, artifact: &Artifact<'_>) -> Decision {
@@ -399,15 +401,11 @@ impl Generation {
     /// keeps the rule free of ordering: what the key's filters say together
     /// is the answer, whichever was read first.
     ///
-    /// A blessing needs the `bad` filter loaded to be honored; that is the
-    /// revocation channel. A missing *sighted* filter is not the same failure —
-    /// that is a bundle predating those tiers, and [`Lookup::open`] has already
-    /// ruled out anything missing by accident.
+    /// Every slot is filled, so the `bad` filter that revokes a blessing is
+    /// always consulted. One that cannot be read now (`None`) blesses
+    /// nothing.
     fn decide_key(&self, kind: Kind, digest: &[u8; 32]) -> Decision {
-        let hit = |tier: Tier| {
-            self.slot(kind, tier)
-                .map_or(Some(false), |slot| slot.may_contain(digest))
-        };
+        let hit = |tier: Tier| self.slot(kind, tier).may_contain(digest);
         let mut worst = None;
         let mut unreadable = false;
         for (tier, verdict) in ADVERSE {
@@ -425,17 +423,13 @@ impl Generation {
             (Some(worst), _) => worst,
             (None, None) => Decision::Unavailable,
             (None, Some(_)) if unreadable => Decision::Unavailable,
-            (None, Some(true)) if self.slot(kind, Tier::Bad).is_some() => Decision::Skip,
-            (None, Some(_)) => Decision::Unknown,
+            (None, Some(true)) => Decision::Skip,
+            (None, Some(false)) => Decision::Unknown,
         }
     }
 
-    const fn slot(&self, kind: Kind, tier: Tier) -> Option<&Slot> {
-        self.slots[kind.index()][tier.index()].as_ref()
-    }
-
-    fn filters(&self) -> impl Iterator<Item = &Slot> {
-        self.slots.iter().flatten().flatten()
+    fn slot(&self, kind: Kind, tier: Tier) -> &Slot {
+        &self.slots[kind.index() * Tier::ALL.len() + tier.index()]
     }
 }
 
@@ -443,25 +437,22 @@ impl Lookup {
     /// A bundle holding nothing: [`Decision::Unknown`] to everything, and no
     /// skips. What a caller falls back to when [`Lookup::open`] fails.
     #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            source: None,
-            current: RwLock::default(),
-            scheme: None,
-        }
+    pub const fn empty() -> Self {
+        Self { bundle: None }
     }
 
     /// Open the bundle in `dir`, requiring the key scheme `scheme`.
     ///
-    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`], and
-    /// every filter it names must be a bare file name in `dir`, have a valid
-    /// header of the stated version, and identify itself as the filter it is
-    /// named as. **Any failure fails the whole open**: a partly readable
-    /// bundle is exactly the case where a stale bless cannot be vetoed.
+    /// The manifest is the authority. It must be at [`MANIFEST_SCHEMA`] and
+    /// name exactly one filter for every (kind, tier), and each filter must be
+    /// a bare file name in `dir`, have a valid header, and identify itself as
+    /// the filter it is named as. **Any failure fails the whole open**: a
+    /// partly readable bundle is exactly the case where a stale bless cannot
+    /// be vetoed.
     ///
     /// A bundle recording a different `scheme` is refused — producer and
     /// consumer that disagree would otherwise match nothing, silently and
-    /// forever. A bundle recording none predates the field and is accepted.
+    /// forever.
     ///
     /// Only headers are read: manifest digests are not re-verified and the
     /// bit arrays are not scanned. Both belong to whoever installs a bundle —
@@ -469,19 +460,19 @@ impl Lookup {
     /// [`crate::Filter::load`] on it — so that opening stays cheap.
     ///
     /// # Errors
-    /// [`OpenError`] for a missing, unparseable, or unsupported manifest, a
-    /// scheme mismatch, or any named filter that will not open.
+    /// [`OpenError`] for a missing, oversized, unparseable, or unsupported
+    /// manifest, a scheme mismatch, a missing or unknown filter entry, or any
+    /// named filter that will not open.
     pub fn open(dir: impl AsRef<Path>, scheme: &str) -> Result<Self, OpenError> {
         let dir = dir.as_ref();
-        let (generation, recorded) = Generation::open(dir, scheme)?;
+        let generation = Generation::open(dir, scheme)?;
         Ok(Self {
-            source: Some(Source {
+            bundle: Some(Bundle {
                 dir: dir.to_owned(),
                 manifest: dir.join(MANIFEST_FILE),
                 scheme: scheme.to_owned(),
+                current: RwLock::new(generation),
             }),
-            current: RwLock::new(generation),
-            scheme: recorded,
         })
     }
 
@@ -489,9 +480,14 @@ impl Lookup {
     /// the worst claim wins, a blessing needs unanimity. A filter that cannot
     /// be read when consulted cannot erase another's claim, but nothing is
     /// blessed without it, and a bundle that cannot be read at all is
-    /// [`Decision::Unavailable`].
+    /// [`Decision::Unavailable`]. [`Lookup::empty`] knows nothing:
+    /// [`Decision::Unknown`].
     pub fn decide(&self, artifact: &Artifact<'_>) -> Decision {
-        self.current()
+        let Some(bundle) = &self.bundle else {
+            return Decision::Unknown;
+        };
+        bundle
+            .current()
             .map_or(Decision::Unavailable, |g| g.decide(artifact))
     }
 
@@ -501,37 +497,39 @@ impl Lookup {
         self.decide(artifact).may_skip()
     }
 
-    /// True when at least one filter is loaded.
+    /// True when a bundle is open: this is not [`Lookup::empty`].
     #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.read().filters().next().is_some()
+    pub const fn is_active(&self) -> bool {
+        self.bundle.is_some()
     }
 
-    /// Total keys across every loaded filter, as their headers record them.
+    /// Total keys across every filter, as their headers record them.
     #[must_use]
     pub fn key_count(&self) -> u64 {
-        self.read().filters().map(|slot| slot.header().n).sum()
+        self.bundle.as_ref().map_or(0, |b| {
+            b.read().slots.iter().map(|slot| slot.header().n).sum()
+        })
     }
 
-    /// The key scheme this bundle recorded when it was opened, if any.
+    /// The key scheme this bundle was opened with, which every bundle it
+    /// reopens must share; `None` for [`Lookup::empty`].
     #[must_use]
     pub fn key_scheme(&self) -> Option<&str> {
-        self.scheme.as_deref()
+        self.bundle.as_ref().map(|b| b.scheme.as_str())
     }
+}
 
+impl Bundle {
     /// The generation to decide with: the one open, if its manifest is still
     /// the one in place, or else a fresh one. `None` when the bundle in place
     /// cannot be opened; the next call tries again.
     fn current(&self) -> Option<RwLockReadGuard<'_, Generation>> {
         let held = self.read();
-        let Some(source) = &self.source else {
-            return Some(held);
-        };
-        if Some(FileId::now(&source.manifest)?) == held.manifest {
+        if FileId::now(&self.manifest)? == held.manifest {
             return Some(held);
         }
         drop(held);
-        let (fresh, _) = Generation::open(&source.dir, &source.scheme).ok()?;
+        let fresh = Generation::open(&self.dir, &self.scheme).ok()?;
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = fresh;
         Some(self.read())
     }
@@ -561,6 +559,11 @@ pub enum OpenError {
         /// What went wrong.
         source: io::Error,
     },
+    /// The manifest is larger than any real one, and was not read.
+    TooLarge {
+        /// The manifest's path.
+        path: PathBuf,
+    },
     /// The manifest is not valid TOML, or not shaped like a manifest.
     Parse {
         /// The manifest's path.
@@ -583,6 +586,18 @@ pub enum OpenError {
         /// What the bundle records.
         found: String,
     },
+    /// The manifest names no filter for this (kind, tier). Every one is
+    /// required: a bundle without its `bad` filter cannot revoke a blessing,
+    /// and one without a `sighted` filter silently drops those claims.
+    Missing {
+        /// The stem with no entry.
+        stem: String,
+    },
+    /// The manifest names a filter for a slot this build does not have.
+    UnknownFilter {
+        /// The stem as the manifest gives it.
+        stem: String,
+    },
     /// A manifest entry's file is not a bare file name in the bundle directory.
     UnsafePath {
         /// The file name as the manifest gives it.
@@ -602,21 +617,17 @@ pub enum OpenError {
         /// The stem the file's own header claims.
         claims: String,
     },
-    /// A filter's header version disagrees with its manifest entry.
-    VersionMismatch {
-        /// The file name as the manifest gives it.
-        file: String,
-        /// The version the manifest records.
-        manifest: u16,
-        /// The version the file's header carries.
-        header: u16,
-    },
 }
 
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "reading {}: {source}", path.display()),
+            Self::TooLarge { path } => write!(
+                f,
+                "{}: manifest is larger than {MAX_MANIFEST_LEN} bytes",
+                path.display()
+            ),
             Self::Parse { path, source } => write!(f, "parsing {}: {source}", path.display()),
             Self::Schema { path, found } => write!(
                 f,
@@ -627,19 +638,13 @@ impl fmt::Display for OpenError {
                 f,
                 "bundle uses key scheme {found:?}, this build uses {expected:?}"
             ),
+            Self::Missing { stem } => write!(f, "manifest names no {stem} filter"),
+            Self::UnknownFilter { stem } => write!(f, "manifest names unknown filter {stem:?}"),
             Self::UnsafePath { file } => write!(f, "{file:?} is not a bare file name"),
             Self::Invalid { file, source } => write!(f, "{file}: {source}"),
             Self::Mislabelled { file, claims } => {
                 write!(f, "{file} identifies itself as {claims}")
             }
-            Self::VersionMismatch {
-                file,
-                manifest,
-                header,
-            } => write!(
-                f,
-                "{file} is format v{header}, the manifest says v{manifest}"
-            ),
         }
     }
 }
@@ -650,11 +655,13 @@ impl std::error::Error for OpenError {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Invalid { source, .. } => Some(source),
-            Self::Schema { .. }
+            Self::TooLarge { .. }
+            | Self::Schema { .. }
             | Self::KeyScheme { .. }
+            | Self::Missing { .. }
+            | Self::UnknownFilter { .. }
             | Self::UnsafePath { .. }
-            | Self::Mislabelled { .. }
-            | Self::VersionMismatch { .. } => None,
+            | Self::Mislabelled { .. } => None,
         }
     }
 }

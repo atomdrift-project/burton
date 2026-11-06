@@ -41,8 +41,8 @@
 //!   replaced, the next decision reopens the bundle whole. A bundle or filter
 //!   that cannot be read when consulted blesses nothing
 //!   ([`Decision::Unavailable`]) and erases no other filter's claim.
-//! - A bless is withheld unless the matching `bad` filter is loaded. That filter
-//!   is the revocation channel.
+//! - A bundle carries a filter for every kind and tier, or it does not open.
+//!   So the `bad` filter that revokes a blessing is always consulted.
 //! - Single-filter membership is not public. Asking "is this blessed?" without
 //!   consulting the adverse tiers is the mistake this crate exists to prevent.
 //!
@@ -70,9 +70,7 @@ pub use bundle::{
     Entry, KeySets, MANIFEST_FILE, MANIFEST_SCHEMA, Manifest, Ratio, Record, VerifyError,
     WriteError, read_manifest, verify, write_bundle,
 };
-pub use filter::{
-    FORMAT_VERSION, Filter, Kind, LoadError, SUPPORTED_VERSIONS, Tier, UnsupportedVersion,
-};
+pub use filter::{FORMAT_VERSION, Filter, Kind, LoadError, Tier};
 pub use lookup::{Artifact, Decision, Lookup, OpenError};
 
 /// Key scheme for bundles whose keys are raw byte strings.

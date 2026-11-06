@@ -245,16 +245,20 @@ fn a_manifest_of_another_schema_is_refused() {
     );
 }
 
+/// A filter from another format version is refused, even under a manifest
+/// this build reads: old filters never mix into a new bundle.
 #[test]
-fn a_filter_whose_version_disagrees_with_the_manifest_is_refused() {
+fn a_filter_of_another_format_version_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
-    edit_manifest(dir.path(), |m| {
-        m.filter.get_mut("purl-bad").unwrap().format_version = 1;
-    });
+    let victim = dir.path().join("purl-bad.adbl");
+    let mut bytes = std::fs::read(&victim).unwrap();
+    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+    std::fs::write(&victim, bytes).unwrap();
+
     let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
     assert!(
-        matches!(&err, OpenError::VersionMismatch { file, manifest: 1, header: 2 }
+        matches!(&err, OpenError::Invalid { file, source: LoadError::UnsupportedVersion(1) }
             if file == "purl-bad.adbl"),
         "{err:?}"
     );
@@ -274,16 +278,34 @@ fn a_bundle_from_a_different_key_scheme_is_refused() {
     assert_eq!(expected, "some-other-scheme/v9");
 }
 
+/// A bundle that names no scheme would match any caller's, so it does not
+/// open under any.
 #[test]
-fn a_bundle_that_names_no_scheme_is_accepted() {
+fn a_bundle_that_names_no_scheme_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
-    edit_manifest(dir.path(), |m| m.key_scheme = None);
+    let path = dir.path().join(MANIFEST_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let stripped: String = text
+        .lines()
+        .filter(|line| !line.starts_with("key_scheme"))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    assert_ne!(stripped, text, "the manifest should have named a scheme");
+    std::fs::write(&path, stripped).unwrap();
 
-    // Nothing to disagree with, so it opens. It just cannot vouch for itself.
-    let lk = Lookup::open(dir.path(), "anything-at-all").unwrap();
-    assert_eq!(lk.key_scheme(), None);
-    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+    for scheme in [SCHEME, "anything-at-all"] {
+        let err = Lookup::open(dir.path(), scheme).unwrap_err();
+        assert!(matches!(err, OpenError::Parse { .. }), "{err:?}");
+    }
+}
+
+#[test]
+fn an_open_lookup_reports_its_scheme() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    assert_eq!(open(dir.path()).key_scheme(), Some(SCHEME));
+    assert_eq!(Lookup::empty().key_scheme(), None);
 }
 
 #[test]
@@ -306,25 +328,42 @@ fn an_unparseable_manifest_is_not_a_bundle() {
     assert!(std::error::Error::source(&err).is_some());
 }
 
+/// A manifest that leaves a slot out does not open. Without `bad` a blessing
+/// could not be revoked; without a `sighted` filter its claims would vanish
+/// silently.
 #[test]
-fn without_the_revocation_channel_nothing_is_blessed() {
+fn a_manifest_missing_any_filter_is_refused() {
+    for victim in ["sha256-bad", "purl-sighted-suspicious", "sha256-good"] {
+        let dir = tempfile::tempdir().unwrap();
+        publish(dir.path());
+        edit_manifest(dir.path(), |m| {
+            m.filter.remove(victim);
+        });
+
+        let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+        assert!(
+            matches!(&err, OpenError::Missing { stem } if stem == victim),
+            "{victim}: {err:?}"
+        );
+        assert!(err.to_string().contains(victim), "{err}");
+    }
+}
+
+/// An entry for a slot this build does not have may carry claims it would
+/// ignore, so the bundle does not open.
+#[test]
+fn a_manifest_naming_an_unknown_filter_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
-
-    // A bundle that never carried a `bad` filter: the manifest does not name
-    // one, so the open succeeds. A blessing with no way to revoke it is still
-    // not honored.
     edit_manifest(dir.path(), |m| {
-        m.filter.remove("sha256-bad");
+        let entry = m.filter["sha256-bad"].clone();
+        m.filter.insert("sha256-sighted-novel".to_owned(), entry);
     });
-    std::fs::remove_file(dir.path().join("sha256-bad.adbl")).unwrap();
-
-    let lk = open(dir.path());
-    assert!(lk.is_active());
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(1))), Decision::Unknown);
-    assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
-    // The purl side still has its own bad channel, so it is unaffected.
-    assert!(lk.may_skip(&Artifact::purl(BLESSED)));
+    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+    assert!(
+        matches!(&err, OpenError::UnknownFilter { stem } if stem == "sha256-sighted-novel"),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -365,26 +404,6 @@ fn an_empty_bundle_opens_and_skips_nothing() {
     assert_eq!(lk.key_count(), 0);
     assert!(!lk.may_skip(&Artifact::sha256(&digest(1))));
     assert!(!lk.may_skip(&Artifact::purl("pkg:npm/anything@1")));
-}
-
-#[test]
-fn a_v1_bundle_opens_and_folds_sightings_into_bad() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut sets = KeySets::new();
-    sets.insert(Tier::Good, Record::sha256(digest(1)));
-    sets.insert(Tier::Bad, Record::sha256(digest(2)));
-    sets.insert(Tier::SightedHostile, Record::sha256(digest(3)));
-    sets.insert(Tier::SightedSuspicious, Record::sha256(digest(4)));
-    let filters = sets.into_filters_for(1, 1e-9).unwrap();
-    write_bundle(dir.path(), &filters, "2026-08-31", SCHEME).unwrap();
-
-    let lk = open(dir.path());
-    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
-    // A v1 client cannot express "sighted", so a corroborated one reads as bad.
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(3))), Decision::KnownBad);
-    // ...and a lone claim is dropped rather than overstated.
-    assert_eq!(lk.decide(&Artifact::sha256(&digest(4))), Decision::Unknown);
 }
 
 #[test]
@@ -439,8 +458,8 @@ fn a_self_contradictory_bundle_conflicts_rather_than_blesses() {
     assert!(!lk.may_skip(&Artifact::sha256(&both)));
 }
 
-/// An open bundle holds no file, so an updater can swap the directory out from
-/// under it on every platform. Once it is gone, nothing is blessed or convicted.
+/// A bundle whose directory is moved away while open has no manifest in
+/// place, so it decides nothing: nothing is blessed or convicted.
 #[test]
 fn a_bundle_moved_away_while_open_decides_nothing() {
     let root = tempfile::tempdir().unwrap();

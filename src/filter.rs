@@ -31,11 +31,10 @@
 //!
 //! # Reading is strict
 //!
-//! [`Filter::load`] rejects rather than interprets: wrong magic, an unknown
-//! version, a tier that version cannot carry, `k` or `m` out of bounds, a
-//! nonzero reserved field, a bit array whose length disagrees with the header,
-//! or one too full or too permissive (`fill^k`) for any correctly sized filter
-//! to be.
+//! [`Filter::load`] rejects rather than interprets: wrong magic, any version
+//! but [`FORMAT_VERSION`], `k` or `m` out of bounds, a nonzero reserved field,
+//! a bit array whose length disagrees with the header, or one too full or too
+//! permissive (`fill^k`) for any correctly sized filter to be.
 
 use std::fmt;
 use std::fs::File;
@@ -44,15 +43,13 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-/// Layout version this build writes. Bump on any header or bit-derivation
-/// change. v2 added the `sighted-*` tiers and is otherwise byte-identical to
-/// v1, which is what lets one build read both.
+/// The one layout version this build reads and writes. Anything else is
+/// [`LoadError::UnsupportedVersion`].
+///
+/// Bump it on any change to the header, the tiers, or how bits are derived:
+/// an older build then refuses the new files instead of misreading them.
+/// Never reuse a number; 1 was an unpublished draft.
 pub const FORMAT_VERSION: u16 = 2;
-
-/// Layout versions this build can read, newest first. A v1 filter is a v2
-/// filter using none of the newer tiers, so reading one is not reinterpretation.
-/// Anything outside this list is [`LoadError::UnsupportedVersion`].
-pub const SUPPORTED_VERSIONS: &[u16] = &[2, 1];
 
 const MAGIC: [u8; 4] = *b"ADBL";
 
@@ -208,16 +205,27 @@ impl Tier {
             Self::SightedSuspicious => "sighted-suspicious",
         }
     }
+}
 
-    /// The lowest format version that can carry this tier. A bundle published
-    /// at an older version must omit the tiers above its own.
-    #[must_use]
-    pub const fn min_format_version(self) -> u16 {
-        match self {
-            Self::Good | Self::Bad => 1,
-            Self::SightedHostile | Self::SightedSuspicious => 2,
-        }
-    }
+/// Canonical artifact stem for a slot, `{kind}-{tier}`, e.g. `purl-good`. The
+/// one place file names are spelled; spelled out so that naming a slot never
+/// allocates. `stems_spell_kind_dash_tier` holds it to the rule.
+pub(crate) const fn stem(kind: Kind, tier: Tier) -> &'static str {
+    const STEMS: [[&str; Tier::ALL.len()]; Kind::ALL.len()] = [
+        [
+            "purl-good",
+            "purl-bad",
+            "purl-sighted-hostile",
+            "purl-sighted-suspicious",
+        ],
+        [
+            "sha256-good",
+            "sha256-bad",
+            "sha256-sighted-hostile",
+            "sha256-sighted-suspicious",
+        ],
+    ];
+    STEMS[kind.index()][tier.index()]
 }
 
 impl fmt::Display for Tier {
@@ -234,7 +242,7 @@ pub enum LoadError {
     Truncated,
     /// Leading bytes are not `"ADBL"`.
     BadMagic,
-    /// A layout version outside [`SUPPORTED_VERSIONS`].
+    /// A layout version other than [`FORMAT_VERSION`].
     UnsupportedVersion(u16),
     /// A header field is structurally invalid. The string names the field.
     Corrupt(&'static str),
@@ -266,7 +274,7 @@ impl fmt::Display for LoadError {
             Self::Truncated => f.write_str("truncated"),
             Self::BadMagic => f.write_str("bad magic (not an ADBL filter)"),
             Self::UnsupportedVersion(v) => {
-                write!(f, "format v{v}, this build reads {SUPPORTED_VERSIONS:?}")
+                write!(f, "format v{v}, this build reads v{FORMAT_VERSION}")
             }
             Self::Corrupt(field) => write!(f, "corrupt header field: {field}"),
             Self::Overfull { set, bits } => write!(
@@ -284,28 +292,12 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// A format version this build cannot write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnsupportedVersion(pub u16);
-
-impl fmt::Display for UnsupportedVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "format v{}, this build writes {SUPPORTED_VERSIONS:?}",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for UnsupportedVersion {}
-
-/// A parsed header: everything about a filter but its bits.
+/// A parsed header: everything about a filter but its bits. The version is
+/// not kept: [`Header::parse`] accepts only [`FORMAT_VERSION`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Header {
     pub(crate) kind: Kind,
     pub(crate) tier: Tier,
-    pub(crate) version: u16,
     k: u32,
     m_bits: u64,
     pub(crate) n: u64,
@@ -319,18 +311,11 @@ impl Header {
             return Err(LoadError::BadMagic);
         }
         let version = u16::from_le_bytes(bytes_at(head, 4));
-        if !SUPPORTED_VERSIONS.contains(&version) {
+        if version != FORMAT_VERSION {
             return Err(LoadError::UnsupportedVersion(version));
         }
         let kind = Kind::from_u8(head[6]).ok_or(LoadError::Corrupt("kind"))?;
         let tier = Tier::from_u8(head[7]).ok_or(LoadError::Corrupt("tier"))?;
-        // A tier the declared version cannot carry means the file is
-        // mislabelled, not merely new. Reject rather than pick a field to
-        // believe: this catches a v2 filter republished under a v1 name, which
-        // would otherwise reach a v1 reader as a plausible-looking `bad`.
-        if tier.min_format_version() > version {
-            return Err(LoadError::Corrupt("tier newer than declared version"));
-        }
         let k = u32::from_le_bytes(bytes_at(head, 8));
         if k == 0 || k > MAX_K {
             return Err(LoadError::Corrupt("k out of range"));
@@ -345,7 +330,6 @@ impl Header {
         Ok(Self {
             kind,
             tier,
-            version,
             k,
             m_bits,
             n: u64::from_le_bytes(bytes_at(head, 20)),
@@ -355,19 +339,6 @@ impl Header {
     /// Bytes in the whole image: the header, then exactly m/8 bytes of bits.
     const fn image_len(&self) -> u64 {
         HEADER_LEN as u64 + self.m_bits / 8
-    }
-
-    /// Canonical artifact stem, e.g. `purl-good`. The one place file names
-    /// are spelled.
-    pub(crate) fn stem(&self) -> String {
-        format!("{}-{}", self.kind, self.tier)
-    }
-
-    /// Whether `stem` is this header's [`Self::stem`], without building it.
-    pub(crate) fn has_stem(&self, stem: &str) -> bool {
-        stem.strip_prefix(self.kind.as_str())
-            .and_then(|rest| rest.strip_prefix('-'))
-            == Some(self.tier.as_str())
     }
 
     fn probes(&self, digest: &[u8; 32]) -> Probes {
@@ -390,7 +361,6 @@ impl fmt::Debug for Filter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Filter")
             .field("stem", &self.stem())
-            .field("version", &self.header.version)
             .field("k", &self.header.k)
             .field("m_bits", &self.header.m_bits)
             .field("n", &self.header.n)
@@ -411,12 +381,6 @@ impl Filter {
         self.header.tier
     }
 
-    /// The layout version this filter carries.
-    #[must_use]
-    pub const fn version(&self) -> u16 {
-        self.header.version
-    }
-
     /// Keys inserted at build time.
     #[must_use]
     pub const fn len(&self) -> u64 {
@@ -431,31 +395,14 @@ impl Filter {
 
     /// Canonical artifact stem, e.g. `purl-good`.
     #[must_use]
-    pub fn stem(&self) -> String {
-        self.header.stem()
+    pub const fn stem(&self) -> &'static str {
+        stem(self.header.kind, self.header.tier)
     }
 
     /// The on-disk image, ready to write. No allocation, no copy.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    /// Re-stamp for an older bundle, or `None` when this tier did not exist at
-    /// that version or the version is not one this build reads.
-    ///
-    /// `None` rather than a silent downgrade: a `sighted-*` filter has no v1
-    /// meaning, and writing one into a v1 bundle hands a client a file it must
-    /// reject, failing its whole update. The caller folds or drops.
-    #[must_use]
-    pub fn stamped_as(mut self, version: u16) -> Option<Self> {
-        if version < self.header.tier.min_format_version() || !SUPPORTED_VERSIONS.contains(&version)
-        {
-            return None;
-        }
-        self.header.version = version;
-        self.bytes[4..6].copy_from_slice(&version.to_le_bytes());
-        Some(self)
     }
 
     /// Test a key for possible membership. `false` is authoritative; `true` is
@@ -465,7 +412,10 @@ impl Filter {
     /// can act on a `good` hit without consulting the adverse tiers.
     pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> bool {
         // `all` short-circuits, so a miss costs about two probes rather than k.
-        self.header.probes(digest).all(|i| bit_set(&self.bytes, i))
+        self.header.probes(digest).all(|idx| {
+            let (at, mask) = bit_in_image(idx);
+            self.bytes[at] & mask != 0
+        })
     }
 
     /// Parse a filter from its on-disk image, taking ownership of the buffer.
@@ -528,6 +478,12 @@ pub(crate) enum OnDiskError {
 impl OnDisk {
     pub(crate) fn open(path: &Path) -> Result<Self, OnDiskError> {
         let file = File::open(path).map_err(OnDiskError::Io)?;
+        let meta = file.metadata().map_err(OnDiskError::Io)?;
+        // A device or directory has no fixed image to probe, whatever its
+        // header says.
+        if !meta.is_file() {
+            return Err(OnDiskError::Io(io::Error::other("not a regular file")));
+        }
         let mut head = [0u8; HEADER_LEN];
         match read_at(&file, &mut head, 0) {
             Ok(()) => {}
@@ -537,7 +493,7 @@ impl OnDisk {
             Err(e) => return Err(OnDiskError::Io(e)),
         }
         let header = Header::parse(&head).map_err(OnDiskError::Invalid)?;
-        if file.metadata().map_err(OnDiskError::Io)?.len() != header.image_len() {
+        if meta.len() != header.image_len() {
             return Err(OnDiskError::Invalid(LoadError::Truncated));
         }
         Ok(Self { file, header })
@@ -556,11 +512,12 @@ impl OnDisk {
         read_at(&self.file, &mut head, 0).is_ok() && Header::parse(&head) == Ok(self.header)
     }
 
-    /// [`Filter::may_contain`], reading one byte per probe.
+    /// [`Filter::may_contain`], reading one byte per probe. Offsets stay
+    /// `u64` throughout: a file may be larger than the address space.
     pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> io::Result<bool> {
         for idx in self.header.probes(digest) {
             let mut byte = [0u8];
-            read_at(&self.file, &mut byte, HEADER_LEN as u64 + (idx >> 3) as u64)?;
+            read_at(&self.file, &mut byte, HEADER_LEN as u64 + (idx >> 3))?;
             if byte[0] & (1u8 << (idx & 7)) == 0 {
                 return Ok(false);
             }
@@ -645,7 +602,6 @@ impl Builder {
             header: Header {
                 kind,
                 tier,
-                version: FORMAT_VERSION,
                 k,
                 m_bits,
                 n: 0,
@@ -657,7 +613,8 @@ impl Builder {
     /// [`digest_of`] a variable-length key.
     pub(crate) fn insert_digest(&mut self, digest: &[u8; 32]) {
         for idx in self.header.probes(digest) {
-            self.bytes[HEADER_LEN + (idx >> 3)] |= 1u8 << (idx & 7);
+            let (at, mask) = bit_in_image(idx);
+            self.bytes[at] |= mask;
         }
         self.header.n += 1;
     }
@@ -673,10 +630,14 @@ impl Builder {
     }
 }
 
-/// Whether bit `idx` of an image's array is set. `idx < m_bits` because
-/// [`Probes`] masks it, and the image holds exactly `m_bits / 8` bytes of bits.
-fn bit_set(image: &[u8], idx: usize) -> bool {
-    image[HEADER_LEN + (idx >> 3)] & (1u8 << (idx & 7)) != 0
+/// Where bit `idx` of an in-memory image lives: the byte's index in the whole
+/// image, and the bit's mask within it.
+///
+/// The cast cannot truncate: `idx < m_bits` because [`Probes`] masks it, and
+/// an image in memory holds `m_bits / 8` bytes, so `idx / 8` fits in `usize`.
+/// [`OnDisk`] has no such bound and never narrows.
+const fn bit_in_image(idx: u64) -> (usize, u8) {
+    (HEADER_LEN + (idx >> 3) as usize, 1 << (idx & 7))
 }
 
 /// The `k` bit indices for one digest. One derivation shared by insert and
@@ -703,18 +664,15 @@ impl Probes {
     }
 }
 
+/// Indices are `u64`, as `m` is: a file may hold more bits than `usize` can
+/// count, and narrowing here would probe the wrong bit.
 impl Iterator for Probes {
-    type Item = usize;
+    type Item = u64;
 
     #[inline]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "idx < m_bits, and a filter that fits in memory or a file has \
-                  m_bits / 8 within usize"
-    )]
-    fn next(&mut self) -> Option<usize> {
+    fn next(&mut self) -> Option<u64> {
         self.left = self.left.checked_sub(1)?;
-        let idx = (self.h & self.mask) as usize;
+        let idx = self.h & self.mask;
         self.h = self.h.wrapping_add(self.step);
         Some(idx)
     }
@@ -845,10 +803,12 @@ mod tests {
 
         assert_eq!(Filter::load(vec![0; 4]).err(), Some(LoadError::Truncated));
         assert_eq!(with(0, b"XXXX"), Some(LoadError::BadMagic));
-        assert_eq!(
-            with(4, &99u16.to_le_bytes()),
-            Some(LoadError::UnsupportedVersion(99))
-        );
+        for version in [0u16, 1, 3, 99] {
+            assert_eq!(
+                with(4, &version.to_le_bytes()),
+                Some(LoadError::UnsupportedVersion(version))
+            );
+        }
         // 2 is the withdrawn `url` kind, 3 the withdrawn `unknown-clean` tier.
         assert_eq!(with(6, &[2]), Some(LoadError::Corrupt("kind")));
         assert_eq!(with(7, &[3]), Some(LoadError::Corrupt("tier")));
@@ -868,18 +828,6 @@ mod tests {
         let mut short = good;
         short.truncate(HEADER_LEN + 1);
         assert_eq!(Filter::load(short).err(), Some(LoadError::Truncated));
-    }
-
-    #[test]
-    fn a_v2_tier_cannot_masquerade_as_v1() {
-        let mut b = Builder::new(Kind::Sha256, Tier::SightedHostile, 1, 1e-9);
-        b.insert_digest(&[7u8; 32]);
-        let mut bytes = b.build().as_bytes().to_vec();
-        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
-        assert_eq!(
-            Filter::load(bytes).err(),
-            Some(LoadError::Corrupt("tier newer than declared version"))
-        );
     }
 
     /// `ALL` is hand-written but the slot arrays are sized by it. A variant
@@ -907,12 +855,21 @@ mod tests {
     }
 
     #[test]
+    fn stems_spell_kind_dash_tier() {
+        for kind in Kind::ALL {
+            for tier in Tier::ALL {
+                assert_eq!(stem(kind, tier), format!("{kind}-{tier}"));
+            }
+        }
+    }
+
+    #[test]
     fn stems_are_unique() {
         let mut seen = std::collections::HashSet::new();
         for kind in Kind::ALL {
             for tier in Tier::ALL {
-                let stem = format!("{}-{}", kind.as_str(), tier.as_str());
-                assert!(seen.insert(stem.clone()), "duplicate stem {stem}");
+                let stem = stem(kind, tier);
+                assert!(seen.insert(stem), "duplicate stem {stem}");
             }
         }
     }
@@ -1075,17 +1032,5 @@ mod tests {
                 "n={n} p={p}: {loaded:?}"
             );
         }
-    }
-
-    #[test]
-    fn stamping_down_drops_tiers_the_version_cannot_carry() {
-        let v2_only = Builder::new(Kind::Sha256, Tier::SightedHostile, 1, 1e-9).build();
-        assert!(v2_only.stamped_as(1).is_none());
-
-        let both = Builder::new(Kind::Sha256, Tier::Bad, 1, 1e-9).build();
-        let v1 = both.stamped_as(1).unwrap();
-        assert_eq!(v1.version(), 1);
-        // The stamp must reach the bytes, not just the struct.
-        assert_eq!(Filter::load(v1.as_bytes().to_vec()).unwrap().version(), 1);
     }
 }

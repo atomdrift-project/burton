@@ -12,16 +12,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::filter::{
-    Builder, Filter, Kind, SUPPORTED_VERSIONS, Tier, UnsupportedVersion, digest_of,
-};
+use crate::filter::{Builder, Filter, Kind, Tier, digest_of, stem};
 use crate::lookup::OpenError;
 
 /// The file naming a bundle's contents. Read by [`crate::Lookup::open`].
 pub const MANIFEST_FILE: &str = "bloom.toml";
 
-/// Manifest layout version. Bump on an incompatible manifest change.
-pub const MANIFEST_SCHEMA: u32 = 1;
+/// The one manifest layout version this build reads and writes.
+///
+/// Bump it on any change to what a manifest says: an older build then
+/// refuses the new bundle instead of misreading it. Never reuse a number;
+/// 1 was an unpublished draft.
+pub const MANIFEST_SCHEMA: u32 = 2;
+
+/// Largest manifest this build will read. A real one is about a kilobyte;
+/// the cap keeps a hostile one from costing unbounded memory.
+pub(crate) const MAX_MANIFEST_LEN: u64 = 64 * 1024;
 
 /// One artifact from the pool. Either field may be absent; a record with
 /// neither contributes nothing.
@@ -94,7 +100,8 @@ impl KeySets {
         )
     }
 
-    /// Build one filter per (kind, tier), at this build's format version.
+    /// Build one filter per (kind, tier): the complete set [`write_bundle`]
+    /// requires.
     ///
     /// `good` is first reduced by every other tier: worst pool wins, and the
     /// weakest claim is enough. A lone unadjudicated citation cannot convict —
@@ -125,38 +132,6 @@ impl KeySets {
         out
     }
 
-    /// Build a bundle for an older format version, folding tiers it cannot
-    /// carry.
-    ///
-    /// v1 has no `sighted` vocabulary, so `sighted-hostile` merges into `bad` —
-    /// v1's own semantics, where a corroborated citation *was* a bad key.
-    /// `sighted-suspicious` is dropped: a v1 client cannot tell a lone
-    /// prediction from a measured verdict, so folding it in would read as bad.
-    ///
-    /// # Errors
-    /// [`UnsupportedVersion`] for a version outside [`SUPPORTED_VERSIONS`].
-    pub fn into_filters_for(
-        mut self,
-        version: u16,
-        target_fp: f64,
-    ) -> Result<Vec<Filter>, UnsupportedVersion> {
-        if !SUPPORTED_VERSIONS.contains(&version) {
-            return Err(UnsupportedVersion(version));
-        }
-        if version < Tier::SightedHostile.min_format_version() {
-            for row in &mut self.sets {
-                let hostile = std::mem::take(&mut row[Tier::SightedHostile.index()]);
-                row[Tier::Bad.index()].extend(hostile);
-                row[Tier::SightedSuspicious.index()].clear();
-            }
-        }
-        Ok(self
-            .into_filters(target_fp)
-            .into_iter()
-            .filter_map(|f| f.stamped_as(version))
-            .collect())
-    }
-
     fn subtract_claims_from_good(&mut self) {
         for row in &mut self.sets {
             let [good, claims @ ..] = row;
@@ -166,7 +141,11 @@ impl KeySets {
 }
 
 /// One filter's entry in the manifest.
+///
+/// Unknown fields are refused, as unknown header fields are: a manifest this
+/// build does not fully understand is not one it may act on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     /// File name within the bundle directory, e.g. `purl-good.adbl`. A bare
     /// name: [`crate::Lookup::open`] refuses anything with a path in it.
@@ -174,29 +153,32 @@ pub struct Entry {
     /// Lowercase hex SHA-256 of the file, for an installer to verify a
     /// download against.
     pub sha256: String,
-    /// The layout version this file was written with.
-    pub format_version: u16,
     /// Keys inserted. Informational.
     pub n: u64,
 }
 
 /// The contract between producing a bundle and opening one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Manifest layout version ([`MANIFEST_SCHEMA`]).
     pub schema: u32,
     /// Build date, `YYYY-MM-DD`.
     pub built: String,
-    /// The key canonicalization that produced this bundle's keys. `None` in
-    /// bundles predating the field, which [`crate::Lookup::open`] accepts: a
-    /// bundle stating nothing cannot contradict the caller.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_scheme: Option<String>,
-    /// One entry per filter, keyed by stem (`purl-good`, …).
+    /// The key canonicalization that produced this bundle's keys.
+    /// [`crate::Lookup::open`] refuses a bundle whose scheme is not the
+    /// caller's.
+    pub key_scheme: String,
+    /// One entry per filter, keyed by stem (`purl-good`, …). A bundle has
+    /// exactly one filter for every (kind, tier).
     pub filter: BTreeMap<String, Entry>,
 }
 
 /// Write every filter to `<dir>/<stem>.adbl`, then the manifest naming them.
+///
+/// `filters` must hold exactly one filter for every (kind, tier), as
+/// [`KeySets::into_filters`] returns: a bundle missing one would be refused
+/// by every reader, so it is refused here before anything is written.
 ///
 /// Each file is written to a temporary name, synced, and renamed into place,
 /// so no reader ever sees a partly written file and the manifest is replaced
@@ -207,25 +189,40 @@ pub struct Manifest {
 /// instead of matching nothing. Run [`verify`] first: nothing here does.
 ///
 /// # Errors
-/// Any file that cannot be written, or a manifest that cannot be serialized.
+/// [`WriteError::FilterCount`] unless every (kind, tier) has exactly one
+/// filter; otherwise any file that cannot be written, or a manifest that
+/// cannot be serialized.
 pub fn write_bundle(
     dir: &Path,
     filters: &[Filter],
     built: &str,
     key_scheme: &str,
 ) -> Result<Manifest, WriteError> {
+    let mut counts = [[0usize; Tier::ALL.len()]; Kind::ALL.len()];
+    for f in filters {
+        counts[f.kind().index()][f.tier().index()] += 1;
+    }
+    for kind in Kind::ALL {
+        for tier in Tier::ALL {
+            let count = counts[kind.index()][tier.index()];
+            if count != 1 {
+                return Err(WriteError::FilterCount {
+                    stem: stem(kind, tier).to_owned(),
+                    count,
+                });
+            }
+        }
+    }
+
     let mut entries = BTreeMap::new();
     for filter in filters {
         let stem = filter.stem();
         let file = format!("{stem}.adbl");
         write_atomic(&dir.join(&file), filter.as_bytes())?;
         entries.insert(
-            stem,
+            stem.to_owned(),
             Entry {
                 sha256: crate::hex(&digest_of(filter.as_bytes())),
-                // The filter's own version, not this build's: a bundle
-                // projected down for older clients writes older headers.
-                format_version: filter.version(),
                 n: filter.len(),
                 file,
             },
@@ -234,7 +231,7 @@ pub fn write_bundle(
     let manifest = Manifest {
         schema: MANIFEST_SCHEMA,
         built: built.to_owned(),
-        key_scheme: Some(key_scheme.to_owned()),
+        key_scheme: key_scheme.to_owned(),
         filter: entries,
     };
     let text = toml::to_string(&manifest).map_err(|source| WriteError::Serialize { source })?;
@@ -269,7 +266,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
 /// switch off [`verify`]'s collapse and ratio checks.
 ///
 /// # Errors
-/// [`OpenError::Io`], [`OpenError::Parse`], or [`OpenError::Schema`].
+/// [`OpenError::Io`], [`OpenError::TooLarge`], [`OpenError::Parse`], or
+/// [`OpenError::Schema`].
 pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
     match load_manifest(dir) {
         Err(OpenError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -281,16 +279,22 @@ pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
 /// the very file read.
 pub(crate) fn load_manifest(dir: &Path) -> Result<(Manifest, Metadata), OpenError> {
     let path = dir.join(MANIFEST_FILE);
-    let read = File::open(&path).and_then(|mut f| {
+    let read = File::open(&path).and_then(|f| {
         let meta = f.metadata()?;
-        let mut text = String::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-        f.read_to_string(&mut text)?;
+        let capacity = usize::try_from(meta.len().min(MAX_MANIFEST_LEN)).unwrap_or(0);
+        let mut text = String::with_capacity(capacity);
+        // One byte past the cap tells a manifest at the limit from one over
+        // it, even when the file grows after the metadata was read.
+        f.take(MAX_MANIFEST_LEN + 1).read_to_string(&mut text)?;
         Ok((text, meta))
     });
     let (text, meta) = match read {
         Ok(read) => read,
         Err(source) => return Err(OpenError::Io { path, source }),
     };
+    if text.len() as u64 > MAX_MANIFEST_LEN {
+        return Err(OpenError::TooLarge { path });
+    }
     let manifest: Manifest = match toml::from_str(&text) {
         Ok(m) => m,
         Err(source) => {
@@ -324,6 +328,13 @@ pub enum WriteError {
         /// What went wrong.
         source: toml::ser::Error,
     },
+    /// A (kind, tier) has no filter, or more than one. Nothing was written.
+    FilterCount {
+        /// The slot's stem.
+        stem: String,
+        /// How many filters were given for it.
+        count: usize,
+    },
 }
 
 impl fmt::Display for WriteError {
@@ -331,6 +342,9 @@ impl fmt::Display for WriteError {
         match self {
             Self::Io { path, source } => write!(f, "writing {}: {source}", path.display()),
             Self::Serialize { source } => write!(f, "serializing the manifest: {source}"),
+            Self::FilterCount { stem, count } => {
+                write!(f, "bundle needs exactly one {stem} filter, got {count}")
+            }
         }
     }
 }
@@ -340,6 +354,7 @@ impl std::error::Error for WriteError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Serialize { source } => Some(source),
+            Self::FilterCount { .. } => None,
         }
     }
 }
@@ -458,7 +473,8 @@ impl std::error::Error for VerifyError {}
 /// 2. No digest in `vouched` — `(label, digest)` pairs for artifacts the
 ///    caller asserts are ubiquitously benign, such as the build host's
 ///    `/bin/ls` — is in any adverse tier, since any of them denies a skip.
-/// 3. No filter collapsed to zero keys or moved past the ratio bounds.
+/// 3. No filter that had keys is missing or collapsed to zero, and none moved
+///    past the ratio bounds.
 ///
 /// [`Ratio::Waive`] downgrades **only** the ratio bounds. Canaries, vouched
 /// digests, and the collapse guard stay fatal. Waived breaches are returned,
@@ -482,7 +498,7 @@ pub fn verify(
         if let Some(f) = digests(c.forbidden).find(|f| f.may_contain(&c.sha256)) {
             return Err(VerifyError::Canary {
                 sha256: crate::hex(&c.sha256),
-                stem: f.stem(),
+                stem: f.stem().to_owned(),
             });
         }
     }
@@ -492,7 +508,7 @@ pub fn verify(
             if let Some((label, _)) = vouched.iter().find(|(_, d)| f.may_contain(d)) {
                 return Err(VerifyError::Vouched {
                     label: label.clone(),
-                    stem: f.stem(),
+                    stem: f.stem().to_owned(),
                 });
             }
         }
@@ -502,14 +518,28 @@ pub fn verify(
     let Some(prev) = prev else {
         return Ok(waived);
     };
+    // A filter gone from the build entirely is the most complete collapse.
+    if let Some((stem, entry)) = prev
+        .filter
+        .iter()
+        .find(|(stem, entry)| entry.n > 0 && !filters.iter().any(|f| f.stem() == *stem))
+    {
+        return Err(VerifyError::Collapsed {
+            stem: stem.clone(),
+            was: entry.n,
+        });
+    }
     for f in filters {
         let stem = f.stem();
-        let Some(was) = prev.filter.get(&stem).map(|e| e.n) else {
+        let Some(was) = prev.filter.get(stem).map(|e| e.n) else {
             continue;
         };
         let now = f.len();
         if was > 0 && now == 0 {
-            return Err(VerifyError::Collapsed { stem, was });
+            return Err(VerifyError::Collapsed {
+                stem: stem.to_owned(),
+                was,
+            });
         }
         if was < RATIO_FLOOR {
             continue;
@@ -517,7 +547,11 @@ pub fn verify(
         if (MAX_SHRINK..=MAX_GROWTH).contains(&ratio(now, was)) {
             continue;
         }
-        let breach = VerifyError::Ratio { stem, was, now };
+        let breach = VerifyError::Ratio {
+            stem: stem.to_owned(),
+            was,
+            now,
+        };
         match policy {
             Ratio::Waive => waived.push(breach),
             Ratio::Enforce => return Err(breach),
@@ -606,42 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn v1_folds_hostile_sightings_and_drops_the_rest() {
-        let filters = sets(&[
-            (Tier::Bad, rec(digest(1))),
-            (Tier::SightedHostile, rec(digest(2))),
-            (Tier::SightedSuspicious, rec(digest(3))),
-        ])
-        .into_filters_for(1, 1e-9)
-        .unwrap();
-
-        assert!(filters.iter().all(|f| f.version() == 1));
-        assert!(filters.iter().all(|f| f.tier().min_format_version() <= 1));
-        let bad = find(&filters, "sha256-bad");
-        assert!(bad.may_contain(&digest(1)));
-        assert!(
-            bad.may_contain(&digest(2)),
-            "hostile sighting should fold in"
-        );
-        assert!(
-            !bad.may_contain(&digest(3)),
-            "weak sighting must be dropped"
-        );
-    }
-
-    #[test]
-    fn an_unsupported_format_version_is_an_error_not_an_empty_bundle() {
-        assert_eq!(
-            KeySets::new().into_filters_for(99, 1e-9).err(),
-            Some(UnsupportedVersion(99))
-        );
-        assert_eq!(
-            KeySets::new().into_filters_for(0, 1e-9).err(),
-            Some(UnsupportedVersion(0))
-        );
-    }
-
-    #[test]
     fn write_and_reopen_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let filters =
@@ -649,7 +647,7 @@ mod tests {
         let m = write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap();
 
         assert_eq!(m.schema, MANIFEST_SCHEMA);
-        assert_eq!(m.key_scheme.as_deref(), Some("test/v1"));
+        assert_eq!(m.key_scheme, "test/v1");
         assert_eq!(m.filter.len(), filters.len());
         assert_eq!(read_manifest(dir.path()).unwrap().as_ref(), Some(&m));
 
@@ -691,6 +689,35 @@ mod tests {
         assert!(std::error::Error::source(&err).is_some());
     }
 
+    /// Every reader refuses a bundle that is missing a slot or names one
+    /// twice, so the writer refuses it first and writes nothing.
+    #[test]
+    fn a_bundle_needs_exactly_one_filter_per_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut filters = KeySets::new().into_filters(1e-9);
+        let at = filters
+            .iter()
+            .position(|f| f.stem() == "sha256-sighted-suspicious")
+            .unwrap();
+        let dropped = filters.remove(at);
+
+        let err = write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap_err();
+        assert!(
+            matches!(&err, WriteError::FilterCount { stem, count: 0 }
+                if stem == "sha256-sighted-suspicious"),
+            "{err:?}"
+        );
+
+        filters.push(dropped);
+        filters.push(KeySets::new().into_filters(1e-9).swap_remove(0));
+        let err = write_bundle(dir.path(), &filters, "2026-08-31", "test/v1").unwrap_err();
+        assert!(
+            matches!(err, WriteError::FilterCount { count: 2, .. }),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn manifest_sha256_matches_the_bytes_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,6 +751,25 @@ mod tests {
         assert!(matches!(
             read_manifest(dir.path()),
             Err(OpenError::Schema { found, .. }) if found == MANIFEST_SCHEMA + 1
+        ));
+    }
+
+    #[test]
+    fn an_oversized_manifest_is_refused_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+        let limit = usize::try_from(MAX_MANIFEST_LEN).unwrap();
+
+        // At the limit it is read (and fails only as TOML); one byte more is not.
+        std::fs::write(&path, "#".repeat(limit)).unwrap();
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(OpenError::Parse { .. })
+        ));
+        std::fs::write(&path, "#".repeat(limit + 1)).unwrap();
+        assert!(matches!(
+            read_manifest(dir.path()),
+            Err(OpenError::TooLarge { .. })
         ));
     }
 
@@ -768,7 +814,7 @@ mod tests {
         Manifest {
             schema: MANIFEST_SCHEMA,
             built: "2026-08-30".to_owned(),
-            key_scheme: Some("test/v1".to_owned()),
+            key_scheme: "test/v1".to_owned(),
             filter: counts
                 .iter()
                 .map(|(stem, n)| {
@@ -777,7 +823,6 @@ mod tests {
                         Entry {
                             file: format!("{stem}.adbl"),
                             sha256: String::new(),
-                            format_version: 2,
                             n: *n,
                         },
                     )
@@ -814,32 +859,37 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_round_trips_with_and_without_a_key_scheme() {
-        let mut m = baseline(&[("sha256-good", 42)]);
-        for scheme in [Some("test/v1".to_owned()), None] {
-            m.key_scheme = scheme.clone();
-            let text = toml::to_string(&m).unwrap();
-            assert_eq!(text.contains("key_scheme"), scheme.is_some());
-            let back: Manifest = toml::from_str(&text).unwrap();
-            assert_eq!(back, m);
-        }
+    fn the_manifest_round_trips() {
+        let m = baseline(&[("sha256-good", 42)]);
+        let back: Manifest = toml::from_str(&toml::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
     }
 
-    /// An older manifest has no `key_scheme` field at all; it must still parse.
+    /// A manifest that does not name its key scheme could be opened under
+    /// any scheme at all, so it does not parse.
     #[test]
-    fn a_manifest_predating_the_key_scheme_field_parses() {
+    fn a_manifest_without_a_key_scheme_is_refused() {
         let text = r#"
-schema = 1
+schema = 2
 built = "2026-01-01"
 [filter.sha256-good]
 file = "sha256-good.adbl"
 sha256 = "00"
-format_version = 2
 n = 7
 "#;
-        let m: Manifest = toml::from_str(text).unwrap();
-        assert_eq!(m.key_scheme, None);
-        assert_eq!(m.filter.len(), 1);
+        let err = toml::from_str::<Manifest>(text).unwrap_err();
+        assert!(err.to_string().contains("key_scheme"), "{err}");
+    }
+
+    /// A field this build does not know may change what the manifest means,
+    /// at the top level or in an entry.
+    #[test]
+    fn a_manifest_with_unknown_fields_is_refused() {
+        let text = toml::to_string(&baseline(&[("sha256-good", 1)])).unwrap();
+        let top = text.replacen("schema", "mystery = 1\nschema", 1);
+        assert!(toml::from_str::<Manifest>(&top).is_err(), "{top}");
+        let entry = text.replacen("n = 1", "n = 1\nformat_version = 2", 1);
+        assert!(toml::from_str::<Manifest>(&entry).is_err(), "{entry}");
     }
 
     #[test]
@@ -914,6 +964,33 @@ n = 7
                 }
             );
         }
+    }
+
+    /// A filter missing from the build has collapsed as surely as an empty
+    /// one, whether or not the override is set.
+    #[test]
+    fn a_vanished_filter_is_a_collapse() {
+        let filters: Vec<Filter> = KeySets::new()
+            .into_filters(1e-9)
+            .into_iter()
+            .filter(|f| f.stem() != "purl-bad")
+            .collect();
+        let prev = baseline(&[("purl-bad", 5)]);
+        for ratio in [Ratio::Enforce, Ratio::Waive] {
+            assert_eq!(
+                verify(&filters, Some(&prev), &[], ratio),
+                Err(VerifyError::Collapsed {
+                    stem: "purl-bad".to_owned(),
+                    was: 5
+                })
+            );
+        }
+        // One that held nothing before has lost nothing.
+        let prev = baseline(&[("purl-bad", 0)]);
+        assert_eq!(
+            verify(&filters, Some(&prev), &[], Ratio::Enforce),
+            Ok(vec![])
+        );
     }
 
     #[test]
