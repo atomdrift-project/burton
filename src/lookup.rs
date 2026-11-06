@@ -205,7 +205,7 @@ impl<'a> Artifact<'a> {
 ///
 /// Filters stay on disk. Opening reads only the manifest and each filter's
 /// header, so it is cheap enough for short-lived processes, and a decision
-/// reads only the few bytes its probes touch, so a bundle costs no memory for
+/// reads one page of each filter it consults, so a bundle costs no memory for
 /// its bits.
 ///
 /// An open bundle follows its directory. Each decision checks the manifest's
@@ -219,6 +219,12 @@ impl<'a> Artifact<'a> {
 /// Elsewhere no handle is held between decisions, so an updater can rename the
 /// directory out from under an open bundle; each decision reopens the filters
 /// it consults instead.
+///
+/// Replace bundle files by renaming over them, as [`write_bundle`] does,
+/// never by rewriting them in place. A held handle keeps the file it opened
+/// through a rename, but an in-place rewrite changes the bytes beneath it,
+/// mid-write included, and nothing re-reads a header to notice: that would
+/// cost every decision a read per filter.
 ///
 /// [`write_bundle`]: crate::write_bundle
 #[derive(Debug)]
@@ -297,12 +303,8 @@ impl Slot {
         self.0.header()
     }
 
-    /// Possible membership; `None` when the filter cannot be read, or was
-    /// rewritten in place since it was opened.
+    /// Possible membership; `None` when the filter cannot be read.
     fn may_contain(&self, digest: &[u8; 32]) -> Option<bool> {
-        if !self.0.is_unchanged() {
-            return None;
-        }
         self.0.may_contain(digest).ok()
     }
 }

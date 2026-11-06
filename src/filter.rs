@@ -1,4 +1,5 @@
-//! The on-disk filter: a 36-byte header followed by a bit array.
+//! The on-disk filter: a header page followed by page-sized blocks, every
+//! key's probes in one block.
 //!
 //! The layout, probe derivation, and load checks are specified in
 //! `FORMAT.md` at the crate root; this module implements it. Reading is
@@ -14,23 +15,33 @@ use sha2::{Digest, Sha256};
 /// The one layout version this build reads and writes. Anything else is
 /// [`LoadError::UnsupportedVersion`].
 ///
-/// Bump it on any change to the header, the tiers, or how bits are derived:
-/// an older build then refuses the new files instead of misreading them.
-/// Never reuse a number; 1 was an unpublished draft.
-pub const FORMAT_VERSION: u16 = 2;
+/// Bump it on any change to the header, the tiers, or how bits are derived,
+/// and on any change to the bundle around the filters: an older build then
+/// refuses the new files instead of misreading them, and publishers can
+/// serve each version from its own prefix. Never reuse a number: pre-release
+/// builds read and published formats 1 and 2.
+pub const FORMAT_VERSION: u16 = 3;
 
 const MAGIC: [u8; 4] = *b"ADBL";
 
 /// Fixed header length in bytes.
 const HEADER_LEN: usize = 36;
 
+/// Bytes in a block: one page. Every probe for a key lands in one block, so
+/// a decision reads one page of each filter.
+const BLOCK_BYTES: usize = 4096;
+
+/// Bits in a block.
+const BLOCK_BITS: u64 = BLOCK_BYTES as u64 * 8;
+
+/// Where the bit array starts. The header is padded with zeros to a whole
+/// block, so every block is page-aligned in the file and a read of one never
+/// touches two pages.
+const DATA_OFFSET: usize = BLOCK_BYTES;
+
 /// Upper bound on hash functions per key. Bounds the probe loop and keeps a
 /// corrupt header from producing an absurd amount of work.
 const MAX_K: u32 = 64;
-
-/// Smallest bit array a filter may declare. Below this, `m / 8` rounds to a
-/// byte count that cannot hold the array the header describes.
-const MIN_BITS: u64 = 64;
 
 /// Highest percentage of set bits a filter may carry. [`Builder::new`] picks k
 /// for its m, so a real filter sits near half full. An arbitrary key passes
@@ -46,8 +57,8 @@ const MAX_EFFECTIVE_FP: f64 = 0.05;
 
 /// Loosest target false-positive rate [`Builder::new`] honours. It sits 50x
 /// under [`MAX_EFFECTIVE_FP`], so no real build can reach the load bound.
-/// A tiny filter (64 bits, a handful of keys) cannot set enough bits even with
-/// zero collisions, and a large one concentrates near half full.
+/// A tiny filter (one block, a handful of keys) cannot set enough bits even
+/// with zero collisions, and a large one concentrates near half full.
 pub(crate) const MAX_TARGET_FP: f64 = 1e-3;
 
 /// Target used when the caller's is not a positive number.
@@ -269,9 +280,9 @@ pub enum HeaderField {
     Tier,
     /// `k`, the probes per key, is out of range.
     K,
-    /// `m`, the bits in the array, is not a large enough power of two.
+    /// `m`, the bits in the array, is not a whole number of blocks.
     M,
-    /// The reserved field is not zero.
+    /// The reserved field, or the padding after the header, is not zero.
     Reserved,
 }
 
@@ -281,8 +292,8 @@ impl fmt::Display for HeaderField {
             Self::Kind => f.write_str("unknown key kind"),
             Self::Tier => f.write_str("unknown trust tier"),
             Self::K => write!(f, "k outside 1..={MAX_K}"),
-            Self::M => write!(f, "m not a power of two of at least {MIN_BITS}"),
-            Self::Reserved => f.write_str("reserved field is nonzero"),
+            Self::M => write!(f, "m not a positive multiple of {BLOCK_BITS}"),
+            Self::Reserved => f.write_str("reserved bytes are nonzero"),
         }
     }
 }
@@ -294,7 +305,8 @@ pub(crate) struct Header {
     pub(crate) kind: Kind,
     pub(crate) tier: Tier,
     k: u32,
-    m_bits: u64,
+    /// Blocks in the bit array; `m` is this many [`BLOCK_BITS`].
+    blocks: u64,
     pub(crate) n: u64,
 }
 
@@ -316,7 +328,7 @@ impl Header {
             return Err(LoadError::Corrupt(HeaderField::K));
         }
         let m_bits = u64::from_le_bytes(bytes_at(head, 12));
-        if m_bits < MIN_BITS || !m_bits.is_power_of_two() {
+        if m_bits == 0 || m_bits % BLOCK_BITS != 0 {
             return Err(LoadError::Corrupt(HeaderField::M));
         }
         if u64::from_le_bytes(bytes_at(head, 28)) != 0 {
@@ -326,18 +338,39 @@ impl Header {
             kind,
             tier,
             k,
-            m_bits,
+            blocks: m_bits / BLOCK_BITS,
             n: u64::from_le_bytes(bytes_at(head, 20)),
         })
     }
 
-    /// Bytes in the whole image: the header, then exactly m/8 bytes of bits.
-    const fn image_len(&self) -> u64 {
-        HEADER_LEN as u64 + self.m_bits / 8
+    /// Bits in the array, `m`.
+    const fn m_bits(&self) -> u64 {
+        self.blocks * BLOCK_BITS
     }
 
-    fn probes(&self, digest: &[u8; 32]) -> Probes {
-        Probes::new(self.k, self.m_bits, digest)
+    /// Bytes in the whole image: the padded header, then the blocks.
+    const fn image_len(&self) -> u64 {
+        DATA_OFFSET as u64 + self.blocks * BLOCK_BYTES as u64
+    }
+
+    /// The block every probe for `digest` falls in, and the probes within it.
+    /// One derivation shared by insert and query, so they cannot drift.
+    fn locate(&self, digest: &[u8; 32]) -> (u64, Probes) {
+        let lane = |i: usize| u64::from_le_bytes(bytes_at(digest, 8 * i));
+        // The block comes from the last lane, by multiply-shift: that maps it
+        // evenly onto any block count, where a modulus would favour low
+        // blocks and a mask would need a power of two.
+        let block = ((u128::from(lane(3)) * u128::from(self.blocks)) >> 64) as u64;
+        // The probes come from the other three, so keys that differ anywhere
+        // in them, patterned test digests included, share no probe set.
+        let seed = lane(0) ^ lane(1).rotate_left(21) ^ lane(2).rotate_left(42);
+        let probes = Probes {
+            state: seed,
+            word: 0,
+            in_word: 0,
+            left: self.k,
+        };
+        (block, probes)
     }
 }
 
@@ -347,7 +380,8 @@ impl Header {
 /// out of it and writing hands it straight back, so a 32 MiB filter costs
 /// 32 MiB once. Membership testing is deliberately not public.
 pub struct Filter {
-    /// The whole on-disk image: [`HEADER_LEN`] bytes of header, then the bits.
+    /// The whole on-disk image: the header padded to [`DATA_OFFSET`], then
+    /// the blocks.
     bytes: Vec<u8>,
     header: Header,
 }
@@ -357,7 +391,7 @@ impl fmt::Debug for Filter {
         f.debug_struct("Filter")
             .field("stem", &self.stem())
             .field("k", &self.header.k)
-            .field("m_bits", &self.header.m_bits)
+            .field("blocks", &self.header.blocks)
             .field("n", &self.header.n)
             .finish_non_exhaustive()
     }
@@ -406,11 +440,9 @@ impl Filter {
     /// Crate-private, and staying that way: anyone who can ask one filter this
     /// can act on a `good` hit without consulting the adverse tiers.
     pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> bool {
-        // `all` short-circuits, so a miss costs about two probes rather than k.
-        self.header.probes(digest).all(|idx| {
-            let (at, mask) = bit_in_image(idx);
-            self.bytes[at] & mask != 0
-        })
+        let (block, probes) = self.header.locate(digest);
+        let start = block_start(block);
+        all_set(&self.bytes[start..start + BLOCK_BYTES], probes)
     }
 
     /// Parse a filter from its on-disk image, taking ownership of the buffer.
@@ -420,16 +452,21 @@ impl Filter {
     ///
     /// # Errors
     /// [`LoadError`] if the buffer is truncated, the magic or version does not
-    /// match, a header field is invalid, or the bit array is implausibly full.
+    /// match, a header field or the padding is invalid, or the bit array is
+    /// implausibly full.
     pub fn load(bytes: Vec<u8>) -> Result<Self, LoadError> {
         let header = Header::parse(bytes.first_chunk().ok_or(LoadError::Truncated)?)?;
-        let Header { k, m_bits, .. } = header;
-        // The image is the header plus exactly m/8 bytes, no more.
+        let (k, m_bits) = (header.k, header.m_bits());
+        // The image is the padded header plus exactly its blocks, no more.
         if bytes.len() as u64 != header.image_len() {
             return Err(LoadError::Truncated);
         }
-        // The array is m/8 bytes, a whole number of words, so count by word.
-        let set: u64 = bytes[HEADER_LEN..]
+        // The padding is reserved, as the reserved field is.
+        if bytes[HEADER_LEN..DATA_OFFSET].iter().any(|&b| b != 0) {
+            return Err(LoadError::Corrupt(HeaderField::Reserved));
+        }
+        // The array is whole blocks, so a whole number of words: count by word.
+        let set: u64 = bytes[DATA_OFFSET..]
             .as_chunks::<8>()
             .0
             .iter()
@@ -498,26 +535,18 @@ impl OnDisk {
         &self.header
     }
 
-    /// Whether the file still carries the header it was opened with. A held
-    /// handle follows the file through an in-place rewrite, which may leave
-    /// different bits behind the same name.
-    #[cfg(unix)]
-    pub(crate) fn is_unchanged(&self) -> bool {
-        let mut head = [0u8; HEADER_LEN];
-        read_at(&self.file, &mut head, 0).is_ok() && Header::parse(&head) == Ok(self.header)
-    }
-
-    /// [`Filter::may_contain`], reading one byte per probe. Offsets stay
-    /// `u64` throughout: a file may be larger than the address space.
+    /// [`Filter::may_contain`], reading the one page-aligned block the key's
+    /// probes fall in. The offset stays `u64`: a file may be larger than the
+    /// address space.
     pub(crate) fn may_contain(&self, digest: &[u8; 32]) -> io::Result<bool> {
-        for idx in self.header.probes(digest) {
-            let mut byte = [0u8];
-            read_at(&self.file, &mut byte, HEADER_LEN as u64 + (idx >> 3))?;
-            if byte[0] & (1u8 << (idx & 7)) == 0 {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let (block, probes) = self.header.locate(digest);
+        let mut bits = [0u8; BLOCK_BYTES];
+        read_at(
+            &self.file,
+            &mut bits,
+            DATA_OFFSET as u64 + block * BLOCK_BYTES as u64,
+        )?;
+        Ok(all_set(&bits, probes))
     }
 }
 
@@ -550,21 +579,20 @@ impl Builder {
     /// `target_fp` above [`MAX_TARGET_FP`] is clamped to it, since a looser
     /// filter would be refused at load; one that is not a positive number
     /// builds at `1e-9`. `expected` is floored at 1 so the filter is never
-    /// zero-bit.
+    /// empty of blocks.
     ///
-    /// `m = -n·ln(p) / (ln 2)²`, rounded up to a power of two so indexing is a
-    /// mask. `k` is `log2(1/p)`, the probe count that reaches `p` at the ideal
-    /// `m`; rounding only made `m` larger, so it reaches `p` here too. The
-    /// textbook `(m/n)·ln 2` would spend up to twice the probes buying accuracy
-    /// nobody asked for — we cap by it only because it is smaller when rounding
-    /// leaves the filter tight.
+    /// `k = ⌈log2(1/p)⌉` and `m = -n·ln(p) / (ln 2)²`, the textbook pair, then
+    /// `k/1000` more bits: blocking leaves some blocks above the mean load,
+    /// which those bits buy back for every `k` up to 64. `m` is rounded up
+    /// to whole blocks, and to no more than that.
     #[must_use]
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
-        reason = "inputs are small positive counts and probabilities, and the \
-                  result is bounded by next_power_of_two and clamped"
+        reason = "inputs are small positive counts and probabilities, and k is \
+                  clamped; the block count of a filter that fits in memory \
+                  fits in usize"
     )]
     pub(crate) fn new(kind: Kind, tier: Tier, expected: u64, target_fp: f64) -> Self {
         const LN2: f64 = std::f64::consts::LN_2;
@@ -575,22 +603,18 @@ impl Builder {
         } else {
             FALLBACK_FP
         };
-        let raw_bits = -(n as f64) * p.ln() / (LN2 * LN2);
-        let m_bits = (raw_bits.ceil() as u64).max(MIN_BITS).next_power_of_two();
-        let needed = -p.log2();
-        let optimal = (m_bits as f64 / n as f64) * LN2;
-        let k = (needed.min(optimal).ceil() as u32).clamp(1, MAX_K);
+        let k = ((-p.log2()).ceil() as u32).clamp(1, MAX_K);
+        let bits = -(n as f64) * p.ln() / (LN2 * LN2) * (1.0 + f64::from(k) / 1000.0);
+        let blocks = ((bits / BLOCK_BITS as f64).ceil() as u64).max(1);
 
-        let mut bytes = Vec::with_capacity(HEADER_LEN + (m_bits / 8) as usize);
-        bytes.extend_from_slice(&MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        bytes.push(kind.to_u8());
-        bytes.push(tier.to_u8());
-        bytes.extend_from_slice(&k.to_le_bytes());
-        bytes.extend_from_slice(&m_bits.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // n, patched by build()
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // reserved
-        bytes.resize(HEADER_LEN + (m_bits / 8) as usize, 0);
+        let mut bytes = vec![0u8; DATA_OFFSET + blocks as usize * BLOCK_BYTES];
+        bytes[..4].copy_from_slice(&MAGIC);
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes[6] = kind.to_u8();
+        bytes[7] = tier.to_u8();
+        bytes[8..12].copy_from_slice(&k.to_le_bytes());
+        bytes[12..20].copy_from_slice(&(blocks * BLOCK_BITS).to_le_bytes());
+        // n is patched in by build(); the reserved field and padding stay zero.
 
         Self {
             bytes,
@@ -598,7 +622,7 @@ impl Builder {
                 kind,
                 tier,
                 k,
-                m_bits,
+                blocks,
                 n: 0,
             },
         }
@@ -607,9 +631,11 @@ impl Builder {
     /// Insert a 32-byte SHA-256 digest: a [`Kind::Sha256`] key itself, or the
     /// [`digest_of`] a variable-length key.
     pub(crate) fn insert_digest(&mut self, digest: &[u8; 32]) {
-        for idx in self.header.probes(digest) {
-            let (at, mask) = bit_in_image(idx);
-            self.bytes[at] |= mask;
+        let (block, probes) = self.header.locate(digest);
+        let start = block_start(block);
+        let bits = &mut self.bytes[start..start + BLOCK_BYTES];
+        for bit in probes {
+            bits[bit / 8] |= 1 << (bit % 8);
         }
         self.header.n += 1;
     }
@@ -625,52 +651,62 @@ impl Builder {
     }
 }
 
-/// Where bit `idx` of an in-memory image lives: the byte's index in the whole
-/// image, and the bit's mask within it.
-///
-/// The cast cannot truncate: `idx < m_bits` because [`Probes`] masks it, and
-/// an image in memory holds `m_bits / 8` bytes, so `idx / 8` fits in `usize`.
-/// [`OnDisk`] has no such bound and never narrows.
-const fn bit_in_image(idx: u64) -> (usize, u8) {
-    (HEADER_LEN + (idx >> 3) as usize, 1 << (idx & 7))
+/// Where block `block` starts in an in-memory image. [`OnDisk`] has no such
+/// bound and never narrows.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "block is below the header's block count, and an image in memory \
+              holds every block, so its offset fits in usize"
+)]
+const fn block_start(block: u64) -> usize {
+    DATA_OFFSET + block as usize * BLOCK_BYTES
 }
 
-/// The `k` bit indices for one digest. One derivation shared by insert and
-/// query, so they cannot drift; an iterator, so a query stops at the first
-/// clear bit.
+/// Whether every probe's bit is set in `block`, one block of a bit array.
+/// `all` short-circuits, so a miss costs about two probes rather than k.
+fn all_set(block: &[u8], mut probes: Probes) -> bool {
+    probes.all(|bit| block[bit / 8] & (1 << (bit % 8)) != 0)
+}
+
+/// The `k` bit indices for one key within its block, drawn from `SplitMix64`:
+/// each output yields four, from its 16-bit quarters, low quarter first, each
+/// taken mod [`BLOCK_BITS`]. An iterator, so a query stops at the first clear
+/// bit.
+///
+/// Not double hashing: within a block that leaves a key's whole probe set
+/// fixed by about 29 bits, and keys sharing a step overlap so much that the
+/// false-positive rate cannot fall below about 1e-5, whatever the size.
 struct Probes {
-    h: u64,
-    step: u64,
-    mask: u64,
+    state: u64,
+    word: u64,
+    in_word: u32,
     left: u32,
 }
 
-impl Probes {
-    fn new(k: u32, m_bits: u64, digest: &[u8; 32]) -> Self {
-        // Lanes 2 and 3 go unused; 128 bits is ample for double hashing.
-        Self {
-            h: u64::from_le_bytes(bytes_at(digest, 0)),
-            // Odd, so it is coprime with the power-of-two modulus and the
-            // indices walk every residue instead of a short cycle.
-            step: u64::from_le_bytes(bytes_at(digest, 8)) | 1,
-            mask: m_bits - 1,
-            left: k,
+impl Iterator for Probes {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        self.left = self.left.checked_sub(1)?;
+        if self.in_word == 0 {
+            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            self.word = splitmix64(self.state);
+            self.in_word = 4;
         }
+        self.in_word -= 1;
+        // Below BLOCK_BITS, so it fits any usize.
+        let bit = (self.word % BLOCK_BITS) as usize;
+        self.word >>= 16;
+        Some(bit)
     }
 }
 
-/// Indices are `u64`, as `m` is: a file may hold more bits than `usize` can
-/// count, and narrowing here would probe the wrong bit.
-impl Iterator for Probes {
-    type Item = u64;
-
-    #[inline]
-    fn next(&mut self) -> Option<u64> {
-        self.left = self.left.checked_sub(1)?;
-        let idx = self.h & self.mask;
-        self.h = self.h.wrapping_add(self.step);
-        Some(idx)
-    }
+/// `SplitMix64`'s output function (Steele, Lea, and Flood, 2014).
+const fn splitmix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// The `N` bytes of `bytes` starting at the constant offset `at`.
@@ -731,11 +767,173 @@ mod tests {
     }
 
     #[test]
-    fn k_is_sized_for_the_target_not_for_the_rounded_up_m() {
-        // 1e-9 needs 30 probes. The textbook k for the rounded-up m would be
-        // far larger and buy accuracy nobody asked for.
+    fn k_is_sized_for_the_target_not_for_the_block() {
+        // 1e-9 needs 30 probes. The textbook k for a one-key filter rounded up
+        // to a whole block would be far larger and buy accuracy nobody asked for.
         let f = build(&["a"], 1e-9);
         assert_eq!(f.header.k, 30);
+    }
+
+    /// Uniform test digests without hashing: `SplitMix64` over a counter.
+    fn random_digests(seed: u64, n: usize) -> Vec<[u8; 32]> {
+        (0..n as u64)
+            .map(|i| {
+                let mut d = [0u8; 32];
+                for (j, lane) in d.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    let z =
+                        splitmix64(seed ^ (i * 4 + j as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    lane.copy_from_slice(&z.to_le_bytes());
+                }
+                d
+            })
+            .collect()
+    }
+
+    fn filled(n: usize, p: f64) -> Filter {
+        let mut b = Builder::new(Kind::Sha256, Tier::Good, n as u64, p);
+        for d in random_digests(1, n) {
+            b.insert_digest(&d);
+        }
+        b.build()
+    }
+
+    fn false_positives(f: &Filter, trials: usize) -> usize {
+        random_digests(2, trials)
+            .iter()
+            .filter(|d| f.may_contain(d))
+            .count()
+    }
+
+    /// Probes must be independent within a block. Double hashing there fixes a
+    /// key's probe set by about 29 bits, and keys sharing a step overlap so
+    /// much that a 1e-6 filter answers wrongly about 1 in 50,000: some 40
+    /// false positives here, where the target allows about 2.
+    #[test]
+    fn there_is_no_false_positive_floor() {
+        let f = filled(5_000, 1e-6);
+        let hits = false_positives(&f, 2_000_000);
+        assert!(hits <= 10, "{hits} false positives in 2,000,000 at 1e-6");
+    }
+
+    /// Many blocks, each loaded unevenly, still meet the target: the k/1000
+    /// margin pays for blocking.
+    #[test]
+    fn blocking_meets_the_target_at_scale() {
+        let f = filled(100_000, 1e-3);
+        assert!(f.header.blocks > 40, "{} blocks", f.header.blocks);
+        let trials = 1_000_000;
+        let hits = false_positives(&f, trials);
+        // About 800 expected; 1,200 is ten standard deviations above 1e-3's 1,000.
+        assert!(hits <= 1_200, "{hits} false positives in {trials} at 1e-3");
+    }
+
+    /// Size follows the keys, to the block: never doubled to a power of two.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_filter_is_as_large_as_its_keys_need() {
+        for (n, p) in [(200_000u64, 1e-9), (1_000_000, 1e-3), (300_000, 1e-12)] {
+            let f = Builder::new(Kind::Sha256, Tier::Good, n, p).build();
+            let k = f.header.k;
+            let ideal = -(n as f64) * p.ln() / (std::f64::consts::LN_2.powi(2));
+            let bits = f.header.m_bits() as f64;
+            let margin = 1.0 + f64::from(k) / 1000.0;
+            assert!(
+                bits >= ideal * margin && bits < ideal * margin + BLOCK_BITS as f64,
+                "n={n} p={p}: {bits} bits for an ideal of {ideal}"
+            );
+        }
+    }
+
+    /// Inserting a key touches one block and no other.
+    #[test]
+    fn a_key_sets_bits_in_one_block_only() {
+        for d in random_digests(3, 50) {
+            let mut b = Builder::new(Kind::Sha256, Tier::Good, 10_000, 1e-9);
+            b.insert_digest(&d);
+            let f = b.build();
+            let touched = f.as_bytes()[DATA_OFFSET..]
+                .as_chunks::<BLOCK_BYTES>()
+                .0
+                .iter()
+                .filter(|block| block.iter().any(|&byte| byte != 0))
+                .count();
+            assert_eq!(touched, 1);
+            assert!(f.may_contain(&d));
+        }
+    }
+
+    /// The block is chosen evenly over any count, not only powers of two.
+    #[test]
+    fn keys_spread_evenly_over_any_block_count() {
+        let header = Header {
+            kind: Kind::Sha256,
+            tier: Tier::Good,
+            k: 1,
+            blocks: 3,
+            n: 0,
+        };
+        let mut counts = [0u32; 3];
+        for d in random_digests(4, 30_000) {
+            let (block, _) = header.locate(&d);
+            counts[usize::try_from(block).unwrap()] += 1;
+        }
+        for c in counts {
+            assert!((9_500..=10_500).contains(&c), "{counts:?}");
+        }
+    }
+
+    /// The wire vector Pulsar's Go builder and Scan's tests share, computed
+    /// from FORMAT.md by a separate implementation: one key, lanes 5, 2, 0,
+    /// 0, at 1e-3 (k = 10, one block).
+    #[test]
+    fn matches_the_shared_wire_vector() {
+        let mut digest = [0u8; 32];
+        digest[0] = 5;
+        digest[8] = 2;
+        let mut b = Builder::new(Kind::Sha256, Tier::Good, 1, 1e-3);
+        b.insert_digest(&digest);
+        let f = b.build();
+        let image = f.as_bytes();
+        assert_eq!(image.len(), 2 * BLOCK_BYTES);
+        assert_eq!(
+            image[..20],
+            [
+                b'A', b'D', b'B', b'L', 3, 0, 3, 1, 10, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        let set: Vec<(usize, u8)> = image[DATA_OFFSET..]
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte != 0)
+            .map(|(i, &byte)| (i, byte))
+            .collect();
+        assert_eq!(
+            set,
+            [
+                (280, 4),
+                (2153, 8),
+                (2317, 32),
+                (2432, 1),
+                (3018, 4),
+                (3290, 64),
+                (3741, 32),
+                (3755, 1),
+                (3942, 4),
+                (4057, 128)
+            ]
+        );
+        digest[0] = 6;
+        assert!(!f.may_contain(&digest));
+    }
+
+    #[test]
+    fn padding_after_the_header_must_be_zero() {
+        let mut bytes = build(&["x"], 1e-9).as_bytes().to_vec();
+        bytes[DATA_OFFSET - 1] = 1;
+        assert_eq!(
+            Filter::load(bytes).err(),
+            Some(LoadError::Corrupt(HeaderField::Reserved))
+        );
     }
 
     #[test]
@@ -798,7 +996,7 @@ mod tests {
 
         assert_eq!(Filter::load(vec![0; 4]).err(), Some(LoadError::Truncated));
         assert_eq!(with(0, b"XXXX"), Some(LoadError::BadMagic));
-        for version in [0u16, 1, 3, 99] {
+        for version in [0u16, 1, 2, 4, 99] {
             assert_eq!(
                 with(4, &version.to_le_bytes()),
                 Some(LoadError::UnsupportedVersion(version))
@@ -949,8 +1147,8 @@ mod tests {
     #[test]
     fn an_all_ones_filter_is_rejected() {
         let mut bytes = build(&["x"], 1e-9).as_bytes().to_vec();
-        let bits = (bytes.len() - HEADER_LEN) as u64 * 8;
-        bytes[HEADER_LEN..].fill(0xff);
+        let bits = (bytes.len() - DATA_OFFSET) as u64 * 8;
+        bytes[DATA_OFFSET..].fill(0xff);
         assert_eq!(
             Filter::load(bytes).err(),
             Some(LoadError::Overfull { set: bits, bits })
@@ -963,12 +1161,12 @@ mod tests {
             .build()
             .as_bytes()
             .to_vec();
-        let array = &mut bytes[HEADER_LEN..];
+        let array = &mut bytes[DATA_OFFSET..];
         let at_limit = array.len() * 3 / 4; // 75% of the bytes, all ones
         array[..at_limit].fill(0xff);
         assert!(Filter::load(bytes.clone()).is_ok(), "75% full must load");
 
-        bytes[HEADER_LEN + at_limit] = 1;
+        bytes[DATA_OFFSET + at_limit] = 1;
         assert!(matches!(
             Filter::load(bytes).err(),
             Some(LoadError::Overfull { .. })
@@ -983,7 +1181,7 @@ mod tests {
             .build()
             .as_bytes()
             .to_vec();
-        let array = &mut bytes[HEADER_LEN..];
+        let array = &mut bytes[DATA_OFFSET..];
         let filled = array.len() * 74 / 100; // about 74% of bits set
         array[..filled].fill(0xff);
         assert!(

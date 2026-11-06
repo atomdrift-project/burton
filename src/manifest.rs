@@ -15,8 +15,8 @@ pub const MANIFEST_FILE: &str = "bloom.toml";
 /// The one manifest layout version this build reads and writes.
 ///
 /// Bump it on any change to what a manifest says: an older build then
-/// refuses the new bundle instead of misreading it. Never reuse a number;
-/// 1 was an unpublished draft.
+/// refuses the new bundle instead of misreading it. Never reuse a number:
+/// pre-release builds read and published schema 1.
 pub const MANIFEST_SCHEMA: u32 = 2;
 
 /// Largest manifest this build will read. A real one is about a kilobyte;
@@ -41,7 +41,7 @@ pub struct Entry {
 }
 
 /// The contract between producing a bundle and opening one.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Manifest layout version ([`MANIFEST_SCHEMA`]).
@@ -52,6 +52,13 @@ pub struct Manifest {
     /// [`crate::Lookup::open`] refuses a bundle whose scheme is not the
     /// caller's.
     pub key_scheme: String,
+    /// Where the keys came from — an upstream release, its digests — for
+    /// people and tools. Burton reads this table but never acts on it, so
+    /// nothing here can change a decision; anything that should belongs at
+    /// the top level, behind a schema bump. Every other unknown field is
+    /// refused.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub provenance: toml::Table,
     /// One entry per filter, keyed by stem (`purl-good`, …). A bundle has
     /// exactly one filter for every (kind, tier).
     pub filter: BTreeMap<String, Entry>,
@@ -198,6 +205,7 @@ mod tests {
             schema: MANIFEST_SCHEMA,
             built: "2026-08-30".to_owned(),
             key_scheme: "test/v1".to_owned(),
+            provenance: toml::Table::new(),
             filter: BTreeMap::from([(
                 "sha256-good".to_owned(),
                 Entry {
@@ -274,8 +282,35 @@ mod tests {
     #[test]
     fn the_manifest_round_trips() {
         let m = sample();
-        let back: Manifest = toml::from_str(&toml::to_string(&m).unwrap()).unwrap();
+        let text = toml::to_string(&m).unwrap();
+        assert!(
+            !text.contains("provenance"),
+            "an empty table is not written"
+        );
+        let back: Manifest = toml::from_str(&text).unwrap();
         assert_eq!(back, m);
+    }
+
+    /// Provenance holds whatever a publisher records, nested or not, and
+    /// survives a round trip; burton only carries it.
+    #[test]
+    fn provenance_is_carried_whatever_its_shape() {
+        let mut m = sample();
+        m.provenance = toml::from_str(
+            r#"
+release = "2026.09.1"
+fp = 1e-9
+sources = [{ member = "RDS.db", sha1 = "67a2" }, { member = "delta.sql", sha1 = "1246" }]
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&m).unwrap();
+        let back: Manifest = toml::from_str(&text).unwrap();
+        assert_eq!(back, m, "{text}");
+        assert_eq!(
+            back.provenance.get("release").and_then(toml::Value::as_str),
+            Some("2026.09.1")
+        );
     }
 
     /// A manifest that does not name its key scheme could be opened under

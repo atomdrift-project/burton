@@ -10,10 +10,13 @@ Initial release, as 0.1.0.
 
 ### Formats
 
-- Filter format 2 and manifest schema 2, specified in `FORMAT.md`. A reader
+- Filter format 3 and manifest schema 2, specified in `FORMAT.md`. A reader
   accepts exactly these versions, and a bundle carries exactly one filter for
   each key kind (`purl`, `sha256`) and trust tier (`good`, `bad`,
-  `sighted-hostile`, `sighted-suspicious`).
+  `sighted-hostile`, `sighted-suspicious`). Pre-release builds published
+  formats 1 and 2 and schema 1; this release reads none of them.
+- An optional manifest `[provenance]` table carries a publisher's own
+  metadata, which burton never interprets.
 
 ### Consuming
 
@@ -22,8 +25,11 @@ Initial release, as 0.1.0.
 - `Lookup::decide` consults every filter for every key: the worst claim wins,
   and a skip needs every key supplied to be blessed. `Decision::may_skip` is
   the one question a fast path should ask.
-- Filters stay on disk, and a decision reads only the bytes its probes touch.
-  On Unix it does so through filters held open, without allocating.
+- Filters stay on disk, and a decision reads one page of each filter it
+  consults: every key's probes fall in one page-aligned 4 KiB block. On Unix
+  it reads through filters held open, without allocating.
+- Filters are sized to whole blocks, not powers of two, so they are as large
+  as their keys need and no larger.
 - An open `Lookup` follows its bundle as it is replaced, and `Lookup::refresh`
   reports why a replacement will not open.
 

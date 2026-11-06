@@ -248,22 +248,43 @@ fn a_manifest_of_another_schema_is_refused() {
     );
 }
 
-/// A filter from another format version is refused, even under a manifest
-/// this build reads: old filters never mix into a new bundle.
+/// A filter from another format version — such as the 1 and 2 that
+/// pre-release builds published — is refused, even under a manifest this
+/// build reads: old filters never mix into a new bundle.
 #[test]
 fn a_filter_of_another_format_version_is_refused() {
+    for old in [1u16, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        publish(dir.path());
+        let victim = dir.path().join("purl-bad.adbl");
+        let mut bytes = std::fs::read(&victim).unwrap();
+        bytes[4..6].copy_from_slice(&old.to_le_bytes());
+        std::fs::write(&victim, bytes).unwrap();
+
+        let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
+        assert!(
+            matches!(&err, OpenError::Invalid { file, source: LoadError::UnsupportedVersion(v) }
+                if file == "purl-bad.adbl" && *v == old),
+            "{err:?}"
+        );
+    }
+}
+
+/// A publisher's provenance rides along without affecting the bundle.
+#[test]
+fn a_bundle_with_provenance_opens_and_decides_as_without() {
     let dir = tempfile::tempdir().unwrap();
     publish(dir.path());
-    let victim = dir.path().join("purl-bad.adbl");
-    let mut bytes = std::fs::read(&victim).unwrap();
-    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
-    std::fs::write(&victim, bytes).unwrap();
-
-    let err = Lookup::open(dir.path(), SCHEME).unwrap_err();
-    assert!(
-        matches!(&err, OpenError::Invalid { file, source: LoadError::UnsupportedVersion(1) }
-            if file == "purl-bad.adbl"),
-        "{err:?}"
+    edit_manifest(dir.path(), |m| {
+        m.provenance = toml::from_str("release = \"2026.09.1\"\nfp = 1e-9\n").unwrap();
+    });
+    let lk = open(dir.path());
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
+    let m = read_manifest(dir.path()).unwrap().unwrap();
+    assert_eq!(
+        m.provenance.get("release").and_then(toml::Value::as_str),
+        Some("2026.09.1")
     );
 }
 
@@ -535,8 +556,11 @@ fn a_revocation_installed_while_open_is_honored() {
     assert!(lk.decide(&Artifact::sha256(&digest(1))).is_adverse());
 }
 
-/// A file that changes tier after open is no longer the filter its slot names,
-/// so it decides nothing rather than blessing from the wrong pool.
+/// Where filters are reopened for every decision, a file that changes tier
+/// after open is no longer the filter its slot names, so it decides nothing
+/// rather than blessing from the wrong pool. On Unix the open handle is read
+/// instead, and files must be replaced by rename, never rewritten in place.
+#[cfg(not(unix))]
 #[test]
 fn a_filter_relabelled_while_open_decides_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -549,6 +573,23 @@ fn a_filter_relabelled_while_open_decides_nothing() {
         lk.decide(&Artifact::sha256(&digest(1))),
         Decision::Unavailable
     );
+}
+
+/// A filter renamed over while the bundle is open, the way every writer
+/// replaces files, leaves the open build intact: its held handle still reads
+/// the file it opened.
+#[cfg(unix)]
+#[test]
+fn a_filter_renamed_over_while_open_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    publish(dir.path());
+    let lk = open(dir.path());
+
+    let staged = dir.path().join("staged.adbl");
+    std::fs::copy(dir.path().join("sha256-bad.adbl"), &staged).unwrap();
+    std::fs::rename(&staged, dir.path().join("sha256-good.adbl")).unwrap();
+    assert!(lk.may_skip(&Artifact::sha256(&digest(1))));
+    assert_eq!(lk.decide(&Artifact::sha256(&digest(2))), Decision::KnownBad);
 }
 
 /// An open bundle answers from the build it opened until the manifest is

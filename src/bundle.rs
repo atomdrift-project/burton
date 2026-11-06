@@ -184,6 +184,7 @@ pub fn write_bundle(
         schema: MANIFEST_SCHEMA,
         built: built.to_owned(),
         key_scheme: key_scheme.to_owned(),
+        provenance: toml::Table::new(),
         filter: entries,
     };
     let text = toml::to_string(&manifest).map_err(|source| WriteError::Serialize { source })?;
@@ -755,6 +756,7 @@ mod tests {
             schema: MANIFEST_SCHEMA,
             built: "2026-08-30".to_owned(),
             key_scheme: "test/v1".to_owned(),
+            provenance: toml::Table::new(),
             filter: counts
                 .iter()
                 .map(|(stem, n)| {
